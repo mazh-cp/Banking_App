@@ -1,0 +1,216 @@
+/**
+ * Single source of truth for financial data. Server-only.
+ * Used by dashboard and chat tools. All queries MUST be scoped by authenticated userId.
+ * When USE_DEMO_FINANCE_DATA=true, reads from SQLite demo DB if session user email matches a demo user.
+ */
+
+import { prisma } from '@/lib/db';
+import { createHash } from 'crypto';
+import {
+  getDemoUserIdByEmail,
+  getBalancesFromDemoDb,
+  getRecentTransactionsFromDemoDb,
+  getAccountsFromDemoDb,
+} from './demo-db-read';
+
+const USE_DEMO_FINANCE_DATA = process.env.USE_DEMO_FINANCE_DATA === 'true';
+
+export type Balances = {
+  checking: number;
+  savings: number;
+  creditCardBalance: number;
+  creditLimit: number;
+  availableCredit: number;
+  asOf: string;
+};
+
+export type RecentTransaction = {
+  type: string;
+  amount: number;
+  description: string | null;
+  date: string;
+};
+
+export type CreditProfile = {
+  utilization: number;
+  utilizationPercent: string;
+  paymentHistorySummary: string;
+  simulatedScoreRange: string;
+  recommendedActions: string[];
+  creditLimit: number;
+  currentBalance: number;
+};
+
+/**
+ * Get balances from same data source as dashboard. Tenant-scoped by userId.
+ */
+export async function getBalances(userId: string): Promise<Balances> {
+  if (USE_DEMO_FINANCE_DATA) {
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true } });
+    const demoUserId = user?.email ? getDemoUserIdByEmail(user.email) : null;
+    if (demoUserId) return getBalancesFromDemoDb(demoUserId);
+  }
+
+  const accounts = await prisma.account.findMany({
+    where: { userId, status: 'active' },
+    orderBy: { type: 'asc' },
+  });
+
+  let checking = 0;
+  let savings = 0;
+  let creditCardBalance = 0;
+  for (const a of accounts) {
+    const bal = Number(a.balance);
+    if (a.type === 'checking') checking = bal;
+    else if (a.type === 'savings') savings = bal;
+    else if (a.type === 'credit') creditCardBalance = bal; // typically negative (amount owed)
+  }
+
+  const creditApp = await prisma.application.findFirst({
+    where: { userId, type: 'credit_card', status: 'approved' },
+  });
+  const creditLimit =
+    creditApp?.amount != null
+      ? Number(creditApp.amount)
+      : (creditApp?.metadata as { limit?: number } | null)?.limit ?? 0;
+  const availableCredit = Math.max(0, creditLimit + creditCardBalance); // credit balance is negative when owed
+
+  const asOf = new Date().toISOString();
+  return {
+    checking,
+    savings,
+    creditCardBalance,
+    creditLimit,
+    availableCredit,
+    asOf,
+  };
+}
+
+export type AccountRow = { id: string; type: string; accountNumber: string; status: string };
+
+/**
+ * Get accounts for dashboard. Same source as balances (Prisma or demo SQLite).
+ */
+export async function getAccounts(userId: string): Promise<AccountRow[]> {
+  if (USE_DEMO_FINANCE_DATA) {
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true } });
+    const demoUserId = user?.email ? getDemoUserIdByEmail(user.email) : null;
+    if (demoUserId) return getAccountsFromDemoDb(demoUserId);
+  }
+  const accounts = await prisma.account.findMany({
+    where: { userId, status: 'active' },
+    orderBy: { type: 'asc' },
+  });
+  return accounts.map((a) => ({
+    id: a.id,
+    type: a.type,
+    accountNumber: a.accountNumber,
+    status: a.status,
+  }));
+}
+
+/**
+ * Get recent transactions. Same source as dashboard. Tenant-scoped.
+ */
+export async function getRecentTransactions(
+  userId: string,
+  limit = 10
+): Promise<RecentTransaction[]> {
+  if (USE_DEMO_FINANCE_DATA) {
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true } });
+    const demoUserId = user?.email ? getDemoUserIdByEmail(user.email) : null;
+    if (demoUserId) return getRecentTransactionsFromDemoDb(demoUserId, limit);
+  }
+
+  const tx = await prisma.transaction.findMany({
+    where: { userId },
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+  });
+  return tx.map((t) => ({
+    type: t.type,
+    amount: Number(t.amount),
+    description: t.description ?? null,
+    date: t.createdAt.toISOString(),
+  }));
+}
+
+/**
+ * Credit profile for eligibility / utilization. Simulated; no proprietary thresholds disclosed.
+ */
+export async function getCreditProfile(userId: string): Promise<CreditProfile> {
+  const balances = await getBalances(userId);
+  const currentBalance = Math.abs(balances.creditCardBalance);
+  const limit = balances.creditLimit;
+  const utilization = limit > 0 ? currentBalance / limit : 0;
+  const utilizationPercent = limit > 0 ? ((currentBalance / limit) * 100).toFixed(1) + '%' : '0%';
+
+  let paymentHistorySummary = 'No credit account or history on file.';
+  const tx = await prisma.transaction.findMany({
+    where: { userId },
+    orderBy: { createdAt: 'desc' },
+    take: 24,
+  });
+  const payments = tx.filter((t) => t.type === 'payment' || t.type === 'credit card payment');
+  if (payments.length > 0) {
+    paymentHistorySummary = `You have ${payments.length} recent payment(s) on file. Keeping utilization low and paying on time supports credit health.`;
+  } else if (limit > 0) {
+    paymentHistorySummary = 'Payment history is still building. On-time payments help improve eligibility.';
+  }
+
+  const recommendedActions: string[] = [];
+  if (utilization > 0.3) {
+    recommendedActions.push('Consider paying down your card balance to lower utilization (under 30% is often favorable).');
+  }
+  if (limit === 0) {
+    recommendedActions.push('You may apply for a credit card in the Apply section to establish a credit line.');
+  }
+
+  return {
+    utilization,
+    utilizationPercent,
+    paymentHistorySummary,
+    simulatedScoreRange: 'Eligibility is based on utilization, payment history, and account tenure. We do not disclose internal score ranges.',
+    recommendedActions,
+    creditLimit: limit,
+    currentBalance,
+  };
+}
+
+/**
+ * Simulated credit increase request. Returns submitted status; no real underwriting.
+ */
+export async function requestCreditIncrease(
+  userId: string,
+  amount: number,
+  reason: string
+): Promise<{ status: string; message: string }> {
+  await prisma.auditEvent.create({
+    data: {
+      eventType: 'CREDIT_INCREASE_REQUEST',
+      userId,
+      metadata: { amount, reason: reason.slice(0, 200), simulated: true },
+    },
+  });
+  return {
+    status: 'submitted',
+    message: `Your request for a credit limit increase of $${amount.toLocaleString()} has been submitted for review. You will receive a decision by mail or in-app notification. This is a simulation.`,
+  };
+}
+
+/**
+ * Compute a snapshot hash for correlation: dashboard and chat use the same formula.
+ * snapshotHash = sha256(JSON.stringify(balances) + timestampBucket).
+ * timestampBucket = floor(now / 300000) * 300000 (5-minute bucket in ms).
+ */
+export function computeSnapshotHash(balances: Balances): string {
+  const bucket = Math.floor(Date.now() / 300_000) * 300_000;
+  const payload = JSON.stringify({
+    checking: balances.checking,
+    savings: balances.savings,
+    creditCardBalance: balances.creditCardBalance,
+    creditLimit: balances.creditLimit,
+    bucket,
+  });
+  return createHash('sha256').update(payload).digest('hex').slice(0, 16);
+}

@@ -1,0 +1,39 @@
+# Dependencies
+node_modules
+.pnpm-store
+
+# Next
+.next
+out
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Prisma
+prisma/migrations/*_migration
+
+# IDE
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Build
+dist
+build
+
+# AppSec / scan
+.gitleaks/
+semgrep.sarif
+*.sarif
+
+# Data (do not commit user uploads or demo DB with PII)
+data/uploads/
+data/db/
+data/seed/*.zip

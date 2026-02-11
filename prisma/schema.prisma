@@ -1,0 +1,266 @@
+// FinGuard Bank Simulator - Prisma Schema
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  passwordHash   String    @map("password_hash")
+  firstName      String    @map("first_name")
+  lastName       String    @map("last_name")
+  preferredName  String?   @map("preferred_name")
+  role           String    @default("customer")
+  ssnLast4Hash   String?   @map("ssn_last4_hash")   // hashed last 4 digits only (simulation)
+  ssnLast4SetAt  DateTime? @map("ssn_last4_set_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  sessions            Session[]
+  accounts            Account[]
+  applications        Application[]
+  transactions        Transaction[]
+  chatAudits          ChatAudit[]
+  fileUploads         FileUpload[]
+  chatSessionStates   ChatSessionState[]
+}
+
+model ChatSessionState {
+  id                    String    @id @default(cuid())
+  userId                String    @unique @map("user_id")
+  verifiedAt            DateTime? @map("verified_at")
+  verificationMethod    String    @default("ssn_last4") @map("verification_method")
+  expiresAt             DateTime? @map("expires_at")
+  verificationFailCount Int       @default(0) @map("verification_fail_count")
+  lockedUntil           DateTime? @map("locked_until")
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([lockedUntil])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  token     String   @unique
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Account {
+  id          String   @id @default(cuid())
+  userId      String   @map("user_id")
+  type        String
+  accountNumber String @unique @map("account_number")
+  balance     Decimal  @db.Decimal(15, 2) @default(0)
+  currency    String   @default("USD")
+  status      String   @default("active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[] @relation("fromAccount")
+  toTransactions Transaction[] @relation("toAccount")
+}
+
+model Application {
+  id          String   @id @default(cuid())
+  userId      String   @map("user_id")
+  type        String
+  status      String   @default("pending")
+  amount      Decimal? @db.Decimal(15, 2)
+  termMonths  Int?     @map("term_months")
+  rate        Decimal? @db.Decimal(5, 2)
+  metadata    Json?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Transaction {
+  id            String   @id @default(cuid())
+  fromAccountId String?  @map("from_account_id")
+  toAccountId  String?  @map("to_account_id")
+  userId        String   @map("user_id")
+  type          String
+  amount        Decimal  @db.Decimal(15, 2)
+  description   String?
+  reference     String?  @unique
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fromAccount Account? @relation("fromAccount", fields: [fromAccountId], references: [id])
+  toAccount   Account? @relation("toAccount", fields: [toAccountId], references: [id])
+}
+
+model ChatAudit {
+  id               String   @id @default(cuid())
+  requestId        String?  @map("request_id")
+  userId           String?  @map("user_id")
+  sessionId        String?  @map("session_id")
+  persona          String?  @map("persona")
+  role             String
+  contentPreview   String?  @map("content_preview") @db.VarChar(500)
+  inputScanResult  Json?    @map("input_scan_result")
+  outputScanResult Json?    @map("output_scan_result")
+  riskScore        Float?   @map("risk_score")
+  riskLevel        String?  @map("risk_level")
+  categories       Json?
+  actionTaken      String?  @map("action_taken")
+  blocked          Boolean  @default(false)
+  safeRewrite      Boolean  @default(false) @map("safe_rewrite")
+  modelUsed        String?  @map("model_used")
+  provider         String?
+  attackSimulation Boolean  @default(false) @map("attack_simulation")
+  securityMode    Boolean  @default(true) @map("security_mode")
+  toolsUsed       Json?    @map("tools_used")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([createdAt])
+  @@index([riskLevel])
+  @@index([requestId])
+}
+
+model FileUpload {
+  id           String    @id @default(cuid())
+  userId       String    @map("user_id")
+  filename     String    @map("filename")
+  originalName String?   @map("original_name")
+  mimeType     String    @map("mime_type")
+  ext          String?   @map("ext")
+  sizeBytes    Int       @map("size_bytes")
+  sha256       String?   @map("sha256")
+  storagePath  String?   @map("storage_path")
+  scanResult   Json?     @map("scan_result")
+  approved     Boolean   @default(false)
+  quarantined  Boolean   @default(false) @map("quarantined")
+  chunkCount   Int       @default(0) @map("chunk_count")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  user     User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  chunks   DocumentChunk[]
+  fileScans FileScan[]
+
+  @@index([userId])
+}
+
+model FileScan {
+  id                String   @id @default(cuid())
+  fileUploadId      String   @map("file_upload_id")
+  userId            String   @map("user_id")
+  categories        Json?
+  severity          String?
+  flagged           Boolean  @default(false) @map("flagged")
+  score             Float?   @map("score")
+  riskLevel         String?  @map("risk_level")
+  extractorWarnings Json?    @map("extractor_warnings")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  fileUpload FileUpload @relation(fields: [fileUploadId], references: [id], onDelete: Cascade)
+
+  @@index([fileUploadId])
+}
+
+model DocumentChunk {
+  id           String   @id @default(cuid())
+  fileUploadId String   @map("file_upload_id")
+  content      String   @db.Text
+  embedding    Json?
+  chunkIndex   Int      @map("chunk_index")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  fileUpload FileUpload @relation(fields: [fileUploadId], references: [id], onDelete: Cascade)
+}
+
+model FinanceRagChunk {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  content   String   @db.Text
+  embedding Json?
+  docType   String   @default("finance") @map("doc_type")
+  chunkIndex Int     @map("chunk_index")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([userId, docType])
+}
+
+model AppSecret {
+  id               String   @id @default(cuid())
+  keyName          String   @unique @map("key_name")
+  ciphertext       String   @map("ciphertext") @db.Text
+  iv               String   @map("iv") @db.VarChar(32)
+  tag              String   @map("tag") @db.VarChar(32)
+  keyVersion       Int      @default(1) @map("key_version")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+  updatedByUserId  String?  @map("updated_by_user_id")
+
+  @@index([keyName])
+}
+
+model AppConfig {
+  id               String   @id @default(cuid())
+  configName       String   @unique @map("config_name")
+  value            String   @db.Text
+  updatedAt        DateTime @updatedAt @map("updated_at")
+  updatedByUserId  String?  @map("updated_by_user_id")
+
+  @@index([configName])
+}
+
+model AuditEvent {
+  id               String   @id @default(cuid())
+  eventType        String   @map("event_type")
+  userId           String?  @map("user_id")
+  actorUserId      String?  @map("actor_user_id")
+  targetUserId     String?  @map("target_user_id")
+  sessionId        String?  @map("session_id")
+  metadata         Json?
+  route            String?  @map("route")
+  riskLevel        String?  @map("risk_level")
+  riskScore        Float?   @map("risk_score")
+  actionTaken      String?  @map("action_taken")
+  provider         String?
+  persona          String?  @map("persona")
+  lakeraRequestId  String?  @map("lakera_request_id")
+  lakeraCategories Json?    @map("lakera_categories")
+  lakeraSeverity   String?  @map("lakera_severity")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  lakeraEvidences LakeraEvidence[]
+
+  @@index([eventType])
+  @@index([createdAt])
+  @@index([userId])
+  @@index([actorUserId])
+}
+
+model LakeraEvidence {
+  id           String      @id @default(cuid())
+  auditEventId String?     @map("audit_event_id")
+  requestId    String      @map("request_id")
+  summaryJson  Json?       @map("summary_json")
+  detectorsJson Json?      @map("detectors_json")
+  createdAt    DateTime    @default(now()) @map("created_at")
+
+  auditEvent   AuditEvent? @relation(fields: [auditEventId], references: [id], onDelete: SetNull)
+
+  @@index([auditEventId])
+  @@index([requestId])
+}

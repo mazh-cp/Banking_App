@@ -28,6 +28,7 @@ model User {
   chatAudits          ChatAudit[]
   fileUploads         FileUpload[]
   chatSessionStates   ChatSessionState[]
+  pendingActions      PendingAction[]
 }
 
 model ChatSessionState {
@@ -263,4 +264,25 @@ model LakeraEvidence {
 
   @@index([auditEventId])
   @@index([requestId])
+}
+
+model PendingAction {
+  id            String    @id @default(cuid())
+  userId        String    @map("user_id")
+  type          String    // TRANSFER | CREDIT_INCREASE
+  status        String    // PENDING | CONFIRMED | EXECUTED | EXPIRED | CANCELLED | FAILED
+  payload       Json      @db.JsonB
+  createdAt     DateTime  @default(now()) @map("created_at")
+  expiresAt     DateTime  @map("expires_at")
+  confirmedAt   DateTime? @map("confirmed_at")
+  executedAt    DateTime? @map("executed_at")
+  failureReason String?   @map("failure_reason") @db.Text
+  metadata      Json?     @db.JsonB
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, status])
+  @@index([userId, type, status])
+  @@index([expiresAt])
 }

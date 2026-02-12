@@ -12,6 +12,7 @@ import {
   getRecentTransactionsFromDemoDb,
   getAccountsFromDemoDb,
 } from './demo-db-read';
+import { TRANSFER_LIMITS } from '@/lib/config/limits';
 
 const USE_DEMO_FINANCE_DATA = process.env.USE_DEMO_FINANCE_DATA === 'true';
 
@@ -179,12 +180,13 @@ export async function getCreditProfile(userId: string): Promise<CreditProfile> {
 
 /**
  * Simulated credit increase request. Returns submitted status; no real underwriting.
+ * For chat: also returns approved, newLimit, effectiveDate, reason for tool output.
  */
 export async function requestCreditIncrease(
   userId: string,
   amount: number,
   reason: string
-): Promise<{ status: string; message: string }> {
+): Promise<{ status: string; message: string; approved?: boolean; newLimit?: number; effectiveDate?: string; reason?: string }> {
   await prisma.auditEvent.create({
     data: {
       eventType: 'CREDIT_INCREASE_REQUEST',
@@ -192,9 +194,106 @@ export async function requestCreditIncrease(
       metadata: { amount, reason: reason.slice(0, 200), simulated: true },
     },
   });
+  const effectiveDate = new Date().toISOString().slice(0, 10);
   return {
     status: 'submitted',
     message: `Your request for a credit limit increase of $${amount.toLocaleString()} has been submitted for review. You will receive a decision by mail or in-app notification. This is a simulation.`,
+    approved: true,
+    newLimit: amount,
+    effectiveDate,
+    reason: 'Simulated approval for demo.',
+  };
+}
+
+export type TransferResult = {
+  transactionId: string;
+  postedAt: string;
+  newBalances: Balances;
+};
+
+/**
+ * Transfer funds between user's own accounts. Atomic. Enforces limits and ownership.
+ */
+export async function transferFunds(
+  userId: string,
+  fromAccount: string,
+  toAccount: string,
+  amount: number
+): Promise<TransferResult> {
+  if (USE_DEMO_FINANCE_DATA) {
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true } });
+    const demoUserId = user?.email ? getDemoUserIdByEmail(user.email) : null;
+    if (demoUserId) {
+      throw new Error('Transfers are not available in demo mode. Use the full app to transfer funds.');
+    }
+  }
+
+  if (amount < TRANSFER_LIMITS.minAmount || amount > TRANSFER_LIMITS.maxPerTransfer) {
+    throw new Error(`Amount must be between $${TRANSFER_LIMITS.minAmount} and $${TRANSFER_LIMITS.maxPerTransfer.toLocaleString()}.`);
+  }
+  if (fromAccount === toAccount) {
+    throw new Error('From and to accounts must be different.');
+  }
+
+  const accounts = await prisma.account.findMany({
+    where: { userId, status: 'active' },
+    orderBy: { type: 'asc' },
+  });
+  const fromAcc = accounts.find((a) => a.type === fromAccount);
+  const toAcc = accounts.find((a) => a.type === toAccount);
+  if (!fromAcc || !toAcc) {
+    throw new Error('One or both accounts not found. Only checking and savings are supported for transfers.');
+  }
+
+  const fromBalance = Number(fromAcc.balance);
+  if (fromBalance < amount) {
+    throw new Error('Insufficient funds in the source account.');
+  }
+
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const transferCount = await prisma.transaction.count({
+    where: {
+      userId,
+      type: 'transfer',
+      createdAt: { gte: todayStart },
+    },
+  });
+  if (transferCount >= TRANSFER_LIMITS.maxPerDay) {
+    throw new Error(`Daily transfer limit (${TRANSFER_LIMITS.maxPerDay}) reached. Try again tomorrow.`);
+  }
+
+  const reference = `tx-${Date.now()}-${createHash('sha256').update(userId + fromAcc.id + toAcc.id + amount).digest('hex').slice(0, 8)}`;
+  const postedAt = new Date();
+
+  const result = await prisma.$transaction(async (tx) => {
+    await tx.account.update({
+      where: { id: fromAcc.id },
+      data: { balance: { decrement: amount } },
+    });
+    await tx.account.update({
+      where: { id: toAcc.id },
+      data: { balance: { increment: amount } },
+    });
+    const t = await tx.transaction.create({
+      data: {
+        userId,
+        fromAccountId: fromAcc.id,
+        toAccountId: toAcc.id,
+        type: 'transfer',
+        amount,
+        description: `Transfer from ${fromAccount} to ${toAccount}`,
+        reference,
+      },
+    });
+    return t;
+  });
+
+  const newBalances = await getBalances(userId);
+  return {
+    transactionId: result.id,
+    postedAt: postedAt.toISOString(),
+    newBalances,
   };
 }
 

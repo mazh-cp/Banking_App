@@ -33,6 +33,40 @@ To use the server-side demo finance pipeline with CSV seed data:
 
 Lakera Guard v2 screens user prompt, retrieved context, and model output; all events are logged to `chat_events` (SQLite). Admin: **GET /api/admin/security-events** (query params: `from`, `to`, `user_id`, `action`).
 
+## Security Gateway (Lakera Guard always-on)
+
+The **Lakera Guard** security gateway is the single point for all screening and runs in four stages in order:
+
+1. **USER_INPUT** – Incoming chat messages (and conversation context) are screened before tools or the model. Blocked requests return a safe message; masked content is replaced with a redacted version.
+2. **RAG_CONTEXT** – Each retrieved RAG chunk is screened; blocked chunks are dropped, masked chunks are replaced before being added to the prompt.
+3. **TOOL_ARGS** – Before any banking tool runs (e.g. getBalances, requestCreditIncrease), serialized arguments are screened. If blocked or masked, the tool is not executed and the user is asked to confirm or re-enter.
+4. **LLM_OUTPUT** – Model responses are screened before being sent to the client. Blocked output is replaced with a generic safe message; masked output is replaced with a redacted version.
+
+**Modes** (env `LAKERA_MODE`):
+
+- **enforce** (default in prod) – Block or mask according to policy.
+- **monitor** – Never block the user; convert block → allow but keep reason codes for tuning.
+- **off** – No API calls; all screening returns allow.
+
+**Fail behavior** (env `LAKERA_FAIL_OPEN`):
+
+- **false** (default) – If Lakera is unreachable, block sensitive actions (USER_INPUT, TOOL_ARGS) and return safe messages.
+- **true** – If Lakera is unreachable, allow and log `lakera_unavailable`.
+
+**Unknown links:** Messages containing URLs whose domain is not in `LAKERA_ALLOWED_DOMAINS` are flagged (`unknown_links`). In enforce mode, such content can be masked (links removed). The chat UI also renders unverified links as plain text with an “Unverified link” label.
+
+**No raw PII or prompts:** Only redacted excerpts (e.g. up to 200 chars) are written to `data/security-events.jsonl`. Admin can view the last N events at **Admin → Security Events** (Time, Stage, Action, Reasons, User, CorrelationId, redacted preview only).
+
+**Single implementation:** All Lakera API calls go through `lib/security/lakera-guard.ts`. The chat route and tool executor use this module only.
+
+## Security & Confirmation Model
+
+- **Tools are authoritative:** Balances and account data come only from banking tools/APIs. RAG is for documents and context only; it is not used as the source of truth for balances or transactions.
+- **Transfers and credit increases** require a verified user (SSN last-4), a **pending action** (created when the assistant proposes the action), and **explicit confirmation** (user replies YES or clicks Confirm). No action is executed via prompt injection alone.
+- **Pending actions** are stored in `PendingAction` with a short TTL (e.g. 10 minutes). Events `CHAT_ACTION_PROPOSED`, `CHAT_ACTION_CONFIRMED`, `CHAT_ACTION_EXECUTED`, `CHAT_ACTION_FAILED`, `CHAT_ACTION_CANCELLED`, `CHAT_ACTION_EXPIRED` are audited.
+- **Intent step (optional):** Set `CHAT_INTENT_ENABLED=true` to use an LLM-based intent classifier for balance/transactions/credit_profile/transfer_request/credit_increase_request. When disabled or low confidence, the existing regex-based tool selection is used as fallback.
+- **Lakera gates:** USER_INPUT always; TOOL_ARGS for action tools (e.g. transferFunds, requestCreditIncrease); LLM_OUTPUT always. All blocks and confirmations are audited.
+
 ## Quick start
 
 ```bash

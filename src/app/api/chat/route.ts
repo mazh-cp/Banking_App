@@ -1,7 +1,19 @@
+/**
+ * Chat API – invariant rules:
+ * - Never execute sensitive actions (transfer, credit increase) without: verified user + pending action token + explicit confirmation.
+ * - Tools are authoritative; RAG is context-only.
+ * - Lakera gates: USER_INPUT always; TOOL_ARGS for action tools; LLM_OUTPUT always.
+ * - All blocks/confirmations/executions must be audited.
+ */
 import { NextResponse } from 'next/server';
 import { requireSession } from '@/lib/auth';
-import { screenPrompt, screenOutput, screenContext } from '@/lib/lakera-guard';
-import { guardText } from '@/lib/security/lakera-v2';
+import {
+  screenText,
+  screenMessages,
+  optionallyExplain,
+  severityFromReasonCodes,
+} from '@/lib/security/lakera-guard';
+import type { LakeraDecision } from '@/lib/security/lakera-types';
 import { chatWithAdapter, type ChatMessage } from '@/lib/chat-adapter';
 import { getRelevantChunks } from '@/lib/rag';
 import { buildSystemPrompt } from '@/lib/security/prompt-firewall';
@@ -10,15 +22,33 @@ import { computeRiskScore } from '@/lib/security/risk-scoring';
 import { redactForAuditPreview } from '@/lib/security/redact';
 import { getSecret, getConfig } from '@/lib/admin/secrets-store';
 import { assertAiReady } from '@/lib/runtime/ai-readiness';
-import { isAccountSpecificQuery, runBankingTool } from '@/lib/ai/tools';
+import { isAccountSpecificQuery } from '@/lib/ai/tools';
 import { isAccountSpecificQuery as isAccountSpecificIntent } from '@/lib/ai/intent';
+import { executeToolSafely } from '@/lib/banking/execute-tool-safely';
 import { getVerificationStatus, setVerified, recordVerificationFailure, isVerificationAttempt } from '@/lib/chat/verification';
 import { verifySSN4 } from '@/lib/security/ssn4';
-import { guardResults } from '@/lib/security/lakera-v2';
 import { prisma } from '@/lib/db';
 import { checkRateLimit } from '@/lib/rate-limit';
+import { logSecurityEvent } from '@/lib/security/security-events';
 import { v4 as uuidv4 } from 'uuid';
 import { z } from 'zod';
+import {
+  expireOldPendingActions,
+  getLatestPendingAction,
+  confirmPendingAction,
+  cancelPendingAction,
+  markExecuted,
+  markFailed,
+  createPendingAction,
+  getPendingActionById,
+  PENDING_ACTION_TYPE,
+} from '@/lib/actions/pendingActions';
+import { isConfirmMessage, isCancelMessage } from '@/lib/chat/confirm';
+import { detectIntent, isIntentConfident } from '@/lib/chat/intent';
+import { buildToolPlan } from '@/lib/chat/dispatch';
+import { formatTrustedToolOutput } from '@/lib/chat/promptParts';
+import { getCreditProfile } from '@/lib/banking/banking-service';
+import { computeCreditIncreaseEligibility } from '@/lib/banking/eligibility';
 
 const MAINTENANCE_MESSAGE = 'System is under Maintenance';
 const REQUIRE_LAKERA_ALWAYS = process.env.REQUIRE_LAKERA_ALWAYS === 'true';
@@ -118,7 +148,27 @@ export async function POST(request: Request) {
     });
   }
 
-  const noOpScan = { flagged: false as const, normalizedCategories: [] as string[], severity: 'low' as const, raw: { skipped: 'validation_disabled' } };
+  const correlationId = requestId;
+  type ScanLike = { flagged: boolean; normalizedCategories: string[]; severity: 'low' | 'medium' | 'high' | 'critical'; raw: Record<string, unknown>; requestId?: string };
+  const noOpScan: ScanLike = { flagged: false, normalizedCategories: [], severity: 'low', raw: { skipped: 'validation_disabled' } };
+
+  // SSN-first: require verification before any chat when user has SSN set (application/chat workflow)
+  if (userId && userContent.trim()) {
+    const userWithSsn = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { ssnLast4Hash: true },
+    });
+    if (userWithSsn?.ssnLast4Hash) {
+      const status = await getVerificationStatus(userId);
+      if (!status.verified && !isVerificationAttempt(userContent)) {
+        return NextResponse.json({
+          message: 'For your security, please confirm the last 4 digits of your SSN to continue.',
+          verificationRequired: true,
+          requestId,
+        });
+      }
+    }
+  }
 
   try {
   const [openaiKey, anthropicKey, lakeraKey, projectId, lakeraInputEnabled, lakeraOutputEnabled] = await Promise.all([
@@ -143,19 +193,51 @@ export async function POST(request: Request) {
     },
   });
 
-  // Pre-scan: Lakera v2 Guard — every prompt scanned when input validation enabled; block before tools/LLM (logs to chat_events)
-  const recentContext = messages.slice(-6).map((m) => `${m.role}: ${m.content}`).join('\n').slice(0, 4000);
-  const inputScan =
-    securityMode && lakeraInputEnabled !== 'false'
-      ? await screenPrompt(userContent, {
-          userId: userId ?? undefined,
-          requestId,
-          persona,
-          context: recentContext,
-          apiKey: lakeraKey,
-          projectId,
-        })
-      : noOpScan;
+  // (1) USER_INPUT screening — single gateway lib/security/lakera-guard
+  // apiKey/projectId from getSecret/getConfig override env (Admin-stored keys when set).
+  // Keep last input decision in scope so we can store LakeraEvidence and optionallyExplain on block.
+  let lastInputDecision: LakeraDecision | null = null;
+  let effectiveUserContent = userContent;
+  let inputScan: ScanLike = noOpScan;
+  if (securityMode && lakeraInputEnabled !== 'false') {
+    const inputDecision = await screenMessages({
+      stage: 'USER_INPUT',
+      messages: messages.map((m) => ({ role: m.role, content: m.content })),
+      userId: userId ?? undefined,
+      sessionId: userId ?? undefined,
+      correlationId,
+      apiKey: lakeraKey,
+      projectId,
+    });
+    lastInputDecision = inputDecision;
+    await logSecurityEvent({
+      correlationId,
+      userId: userId ?? 'anonymous',
+      stage: 'USER_INPUT',
+      action: inputDecision.action,
+      reasonCodes: inputDecision.reasonCodes,
+      redactedPreview: inputDecision.redactedText?.slice(0, 200),
+      lakeraAvailable: !inputDecision.reasonCodes.includes('lakera_unavailable'),
+    });
+    if (inputDecision.action === 'mask' && inputDecision.redactedText !== undefined) {
+      effectiveUserContent = inputDecision.redactedText;
+      const lastIdx = messages.length - 1;
+      if (lastIdx >= 0 && messages[lastIdx]?.role === 'user') {
+        messages[lastIdx] = { ...messages[lastIdx], content: inputDecision.redactedText };
+      }
+    }
+    inputScan = {
+      flagged: inputDecision.action === 'block',
+      normalizedCategories: inputDecision.reasonCodes,
+      severity: severityFromReasonCodes(inputDecision.reasonCodes),
+      raw: {
+        request_uuid: (inputDecision.raw as { request_uuid?: string })?.request_uuid,
+        flagged: (inputDecision.raw as { flagged?: boolean })?.flagged,
+        breakdown: inputDecision.reasonCodes.length ? [{ detected: true, risk_score: inputDecision.action === 'block' ? 0.7 : 0.3 }] : [],
+      },
+      requestId: (inputDecision.raw as { request_uuid?: string })?.request_uuid,
+    };
+  }
 
   const blockCategories = ['prompt_injection', 'data_exfiltration', 'data_exfil', 'fraud_or_criminal_intent', 'fraud', 'system_prompt_extraction', 'tool_abuse'];
   const shouldBlockLakera =
@@ -172,12 +254,12 @@ export async function POST(request: Request) {
     });
     await prisma.chatAudit.create({
       data: {
-        requestId,
+        requestId: correlationId,
         userId,
         sessionId: userId,
         persona,
         role: 'user',
-        contentPreview: redactForAuditPreview(userContent),
+        contentPreview: redactForAuditPreview(effectiveUserContent),
         inputScanResult: inputScan.raw as object,
         riskScore: score,
         riskLevel: level,
@@ -205,32 +287,34 @@ export async function POST(request: Request) {
         lakeraRequestId: inputScan.requestId ?? undefined,
         lakeraCategories: inputScan.normalizedCategories as unknown as object,
         lakeraSeverity: inputScan.severity,
-        metadata: { requestId },
+        metadata: { requestId: correlationId },
       },
     });
-    if (inputScan.requestId && lakeraKey) {
-      try {
-        const results = await guardResults(inputScan.requestId, lakeraKey);
-        if (results && typeof results === 'object') {
-          const summary = (results as { summary?: unknown }).summary ?? results;
-          const detectors = (results as { breakdown?: unknown }).breakdown ?? (results as { detectors?: unknown }).detectors;
+    if (lastInputDecision && inputScan.requestId && lakeraKey) {
+      await optionallyExplain(lastInputDecision, lakeraKey);
+      if (lastInputDecision.results != null) {
+        const results = lastInputDecision.results as Record<string, unknown>;
+        const summary = results.summary ?? results;
+        const detectors = results.breakdown ?? results.detectors;
+        try {
           await prisma.lakeraEvidence.create({
             data: {
               auditEventId: auditEvent.id,
               requestId: inputScan.requestId,
-              summaryJson: summary as object,
+              summaryJson: (summary ?? results) as object,
               ...(detectors != null && { detectorsJson: detectors as object }),
             },
           });
+        } catch {
+          // non-fatal
         }
-      } catch {
-        // non-fatal
       }
     }
     return NextResponse.json({
-      message: "I can't help with that request for security reasons.",
+      ok: false,
       blocked: true,
-      requestId,
+      message: "I can't help with that request. Try rephrasing or ask a banking question like balance, transfers, payments.",
+      requestId: correlationId,
       riskLevel: level,
       riskScore: score,
       categories: inputScan.normalizedCategories,
@@ -244,9 +328,10 @@ export async function POST(request: Request) {
   let dataAsOf: string | undefined;
   let toolsUsed: string[] = [];
 
-  // Identity verification gate: account-specific requests require SSN4 before tools
-  const sensitive = isAccountSpecificIntent(userContent);
-  if (sensitive && userId && toolsAllowed) {
+  // Identity verification gate: account-specific requests require SSN4 before tools.
+  // Also allow block when user sends only 4 digits (verification attempt) so setVerified can run.
+  const sensitive = isAccountSpecificIntent(effectiveUserContent);
+  if ((sensitive || isVerificationAttempt(effectiveUserContent)) && userId && toolsAllowed) {
     const userWithSsn = await prisma.user.findUnique({
       where: { id: userId },
       select: { ssnLast4Hash: true },
@@ -269,7 +354,7 @@ export async function POST(request: Request) {
         requestId,
       });
     }
-    if (isVerificationAttempt(userContent)) {
+    if (isVerificationAttempt(effectiveUserContent)) {
       const status = await getVerificationStatus(userId);
       if (!status.verified && status.reason === 'locked' && status.lockedUntil) {
         await prisma.auditEvent.create({
@@ -288,7 +373,7 @@ export async function POST(request: Request) {
           requestId,
         });
       }
-      const ok = await verifySSN4(userContent, userWithSsn.ssnLast4Hash);
+      const ok = await verifySSN4(effectiveUserContent, userWithSsn.ssnLast4Hash);
       if (ok) {
         const { expiresAt } = await setVerified(userId);
         await prisma.auditEvent.create({
@@ -359,41 +444,253 @@ export async function POST(request: Request) {
     }
   }
 
-  if (toolsAllowed && userId && isAccountSpecificQuery(userContent)) {
-    const balanceResult = await runBankingTool('banking.getBalances', userId);
-    if (balanceResult.success && balanceResult.data) {
-      toolContext += `\n[Trusted Tool Output - banking.getBalances]\n${JSON.stringify(balanceResult.data)}\n`;
-      if (balanceResult.snapshotHash) snapshotHash = balanceResult.snapshotHash;
-      if ((balanceResult.data as { asOf?: string }).asOf) dataAsOf = (balanceResult.data as { asOf: string }).asOf;
-      toolsUsed.push('banking.getBalances');
+  // Expire old pending actions; handle confirm/cancel when user has a pending action
+  await expireOldPendingActions();
+  const pendingAction = userId ? await getLatestPendingAction(userId) : null;
+  if (pendingAction && userId) {
+    if (isConfirmMessage(effectiveUserContent)) {
+      const confirmed = await confirmPendingAction(userId, pendingAction.id);
+      if (!confirmed) {
+        return NextResponse.json({
+          message: 'This request has expired or was already handled. You can start a new transfer or credit increase request.',
+          requestId: correlationId,
+        });
+      }
+      const action = await getPendingActionById(userId, pendingAction.id);
+      if (!action || action.status !== 'CONFIRMED') {
+        return NextResponse.json({ message: 'Unable to proceed. Please try again.', requestId: correlationId });
+      }
+      const payload = action.payload as { fromAccount?: string; toAccount?: string; amount?: number; increaseAmount?: number };
+      let toolResult: { success: boolean; data?: unknown; error?: string } = { success: false, error: 'Unknown action' };
+      if (action.type === PENDING_ACTION_TYPE.TRANSFER && payload.fromAccount && payload.toAccount && payload.amount) {
+        toolResult = await executeToolSafely({
+          toolName: 'banking.transferFunds',
+          toolArgs: { fromAccount: payload.fromAccount, toAccount: payload.toAccount, amount: payload.amount },
+          userId,
+          correlationId,
+          apiKey: lakeraKey,
+          projectId,
+        });
+      } else if (action.type === PENDING_ACTION_TYPE.CREDIT_INCREASE && payload.increaseAmount != null) {
+        toolResult = await executeToolSafely({
+          toolName: 'banking.requestCreditIncrease',
+          toolArgs: { amount: payload.increaseAmount, reason: 'User confirmed in chat' },
+          userId,
+          correlationId,
+          apiKey: lakeraKey,
+          projectId,
+        });
+      }
+      if (toolResult.success && toolResult.data) {
+        await markExecuted(userId, pendingAction.id);
+        const toolContextForResponse = formatTrustedToolOutput(
+          action.type === PENDING_ACTION_TYPE.TRANSFER ? 'banking.transferFunds' : 'banking.requestCreditIncrease',
+          toolResult.data,
+          { userId }
+        );
+        const systemPromptBase = buildSystemPrompt(persona, '');
+        const systemPrompt = systemPromptBase + `\n\nTrusted Tool Output (use ONLY this data):\n${toolContextForResponse}`;
+        const chatMessages: ChatMessage[] = messages.map((m) => ({ role: m.role, content: m.content }));
+        const result = await chatWithAdapter(chatMessages, systemPrompt, provider, { openai: openaiKey, anthropic: anthropicKey });
+        return NextResponse.json({
+          message: result.content,
+          blocked: false,
+          requestId: correlationId,
+          actionExecuted: true,
+          pendingActionId: pendingAction.id,
+        });
+      }
+      await markFailed(userId, pendingAction.id, toolResult.error ?? 'Execution failed');
+      return NextResponse.json({
+        message: toolResult.error ?? 'The action could not be completed. Please try again.',
+        requestId: correlationId,
+        actionExecuted: false,
+      });
     }
-    if (/\b(transaction|recent|history)\b/i.test(userContent)) {
-      const txResult = await runBankingTool('banking.getRecentTransactions', userId);
+    if (isCancelMessage(effectiveUserContent)) {
+      await cancelPendingAction(userId, pendingAction.id);
+      return NextResponse.json({
+        message: 'Request cancelled. No changes were made.',
+        requestId: correlationId,
+        pendingActionId: pendingAction.id,
+      });
+    }
+  }
+
+  // Intent + dispatch (or regex fallback): run read-only tools; optionally create proposal (PendingAction)
+  const intentResult = userId && toolsAllowed
+    ? await detectIntent({ message: effectiveUserContent, openaiKey, anthropicKey })
+    : null;
+  const plan = buildToolPlan(intentResult, effectiveUserContent);
+  const verificationStatus = userId ? await getVerificationStatus(userId) : null;
+  const verified = verificationStatus?.verified === true;
+  let allowBankingTools = false;
+  if (userId && (isIntentConfident(intentResult) ? plan.steps.length > 0 : isAccountSpecificQuery(effectiveUserContent))) {
+    allowBankingTools = toolsAllowed ? true : verified === true;
+  }
+
+  for (const step of plan.steps) {
+    if (step.kind !== 'tool') continue;
+    if (step.tool === 'banking.getBalances') {
+      const balanceResult = await executeToolSafely({
+        toolName: 'banking.getBalances',
+        toolArgs: {},
+        userId,
+        correlationId,
+        apiKey: lakeraKey,
+        projectId,
+      });
+      if (balanceResult.success && balanceResult.data) {
+        toolContext += `\n${formatTrustedToolOutput('banking.getBalances', balanceResult.data, { userId: userId ?? undefined })}\n`;
+        if (balanceResult.snapshotHash) snapshotHash = balanceResult.snapshotHash;
+        if ((balanceResult.data as { asOf?: string }).asOf) dataAsOf = (balanceResult.data as { asOf: string }).asOf;
+        toolsUsed.push('banking.getBalances');
+      }
+    } else if (step.tool === 'banking.getRecentTransactions') {
+      const txResult = await executeToolSafely({
+        toolName: 'banking.getRecentTransactions',
+        toolArgs: {},
+        userId,
+        correlationId,
+        apiKey: lakeraKey,
+        projectId,
+      });
       if (txResult.success && txResult.data) {
-        toolContext += `\n[Trusted Tool Output - banking.getRecentTransactions]\n${JSON.stringify(txResult.data)}\n`;
+        toolContext += `\n${formatTrustedToolOutput('banking.getRecentTransactions', txResult.data, { userId: userId ?? undefined })}\n`;
         toolsUsed.push('banking.getRecentTransactions');
       }
-    }
-    if (/\b(credit\s*limit|utilization|increase|eligibility)\b/i.test(userContent)) {
-      const profileResult = await runBankingTool('banking.getCreditProfile', userId);
+    } else if (step.tool === 'banking.getCreditProfile') {
+      const profileResult = await executeToolSafely({
+        toolName: 'banking.getCreditProfile',
+        toolArgs: {},
+        userId,
+        correlationId,
+        apiKey: lakeraKey,
+        projectId,
+      });
       if (profileResult.success && profileResult.data) {
-        toolContext += `\n[Trusted Tool Output - banking.getCreditProfile]\n${JSON.stringify(profileResult.data)}\n`;
+        toolContext += `\n${formatTrustedToolOutput('banking.getCreditProfile', profileResult.data, { userId: userId ?? undefined })}\n`;
         toolsUsed.push('banking.getCreditProfile');
       }
     }
   }
 
+  if (!isIntentConfident(intentResult) && allowBankingTools) {
+    const balanceResult = await executeToolSafely({
+      toolName: 'banking.getBalances',
+      toolArgs: {},
+      userId,
+      correlationId,
+      apiKey: lakeraKey,
+      projectId,
+    });
+    if (balanceResult.success && balanceResult.data && !toolsUsed.includes('banking.getBalances')) {
+      toolContext += `\n${formatTrustedToolOutput('banking.getBalances', balanceResult.data, { userId: userId ?? undefined })}\n`;
+      if (balanceResult.snapshotHash) snapshotHash = balanceResult.snapshotHash;
+      if ((balanceResult.data as { asOf?: string }).asOf) dataAsOf = (balanceResult.data as { asOf: string }).asOf;
+      toolsUsed.push('banking.getBalances');
+    }
+    if (/\b(transaction|recent|history)\b/i.test(effectiveUserContent) && !toolsUsed.includes('banking.getRecentTransactions')) {
+      const txResult = await executeToolSafely({
+        toolName: 'banking.getRecentTransactions',
+        toolArgs: {},
+        userId,
+        correlationId,
+        apiKey: lakeraKey,
+        projectId,
+      });
+      if (txResult.success && txResult.data) {
+        toolContext += `\n${formatTrustedToolOutput('banking.getRecentTransactions', txResult.data, { userId: userId ?? undefined })}\n`;
+        toolsUsed.push('banking.getRecentTransactions');
+      }
+    }
+    if (/\b(credit\s*limit|utilization|increase|eligibility)\b/i.test(effectiveUserContent) && !toolsUsed.includes('banking.getCreditProfile')) {
+      const profileResult = await executeToolSafely({
+        toolName: 'banking.getCreditProfile',
+        toolArgs: {},
+        userId,
+        correlationId,
+        apiKey: lakeraKey,
+        projectId,
+      });
+      if (profileResult.success && profileResult.data) {
+        toolContext += `\n${formatTrustedToolOutput('banking.getCreditProfile', profileResult.data, { userId: userId ?? undefined })}\n`;
+        toolsUsed.push('banking.getCreditProfile');
+      }
+    }
+  }
+
+  const proposalStep = plan.steps.find((s) => s.kind === 'proposal');
+  if (proposalStep && proposalStep.kind === 'proposal' && userId && verified) {
+    if (proposalStep.type === 'TRANSFER') {
+      const { fromAccount, toAccount, amount } = proposalStep.payload;
+      if (amount > 0 && fromAccount && toAccount && fromAccount !== toAccount) {
+        const action = await createPendingAction(userId, PENDING_ACTION_TYPE.TRANSFER, { fromAccount, toAccount, amount }, 10);
+        const message = `You're about to transfer $${amount.toLocaleString()} from ${fromAccount} to ${toAccount}. Reply YES to confirm or NO to cancel. Expires in 10 minutes.`;
+        return NextResponse.json({
+          message,
+          requestId: correlationId,
+          pendingActionId: action.id,
+          pendingActionSummary: { type: 'TRANSFER', fromAccount, toAccount, amount },
+        });
+      }
+    }
+    if (proposalStep.type === 'CREDIT_INCREASE') {
+      const { increaseAmount } = proposalStep.payload;
+      const profile = await getCreditProfile(userId);
+      const eligibility = computeCreditIncreaseEligibility(profile, increaseAmount);
+      if (!eligibility.eligible) {
+        return NextResponse.json({
+          message: eligibility.reason ?? 'You are not eligible for a credit increase at this time.',
+          requestId: correlationId,
+        });
+      }
+      const amount = increaseAmount > 0 ? eligibility.recommendedIncrease : eligibility.recommendedIncrease;
+      const newLimit = eligibility.newLimit;
+      const action = await createPendingAction(
+        userId,
+        PENDING_ACTION_TYPE.CREDIT_INCREASE,
+        { increaseAmount: amount, recommendedLimit: newLimit },
+        10
+      );
+      const message = `Based on your profile, you appear eligible for an increase of $${amount.toLocaleString()} (new limit $${newLimit.toLocaleString()}). Reply YES to proceed or NO to cancel. Expires in 10 minutes.`;
+      return NextResponse.json({
+        message,
+        requestId: correlationId,
+        pendingActionId: action.id,
+        pendingActionSummary: { type: 'CREDIT_INCREASE', increaseAmount: amount, newLimit },
+      });
+    }
+  }
+
+  // (2) RAG_CONTEXT screening — per chunk
   let ragContext = '';
   let usedRag = false;
   if (useRag && userId) {
     const verificationStatus = await getVerificationStatus(userId);
     const includeFinance = verificationStatus.verified === true;
-    const chunks = await getRelevantChunks(userContent, userId, { includeFinance, openaiApiKey: openaiKey });
-    if (chunks.length) {
+    const chunks = await getRelevantChunks(effectiveUserContent, userId, { includeFinance, openaiApiKey: openaiKey });
+    if (chunks.length && securityMode && lakeraInputEnabled !== 'false') {
+      const screened: string[] = [];
+      for (let i = 0; i < chunks.length; i++) {
+        const decision = await screenText({
+          stage: 'RAG_CONTEXT',
+          text: chunks[i],
+          userId: userId ?? undefined,
+          correlationId,
+          apiKey: lakeraKey,
+          projectId,
+        });
+        if (decision.action === 'block') continue;
+        screened.push(decision.action === 'mask' && decision.redactedText ? decision.redactedText : chunks[i]);
+      }
+      if (screened.length) {
+        ragContext = screened.map((c, i) => `[${i + 1}] ${c}`).join('\n');
+        usedRag = true;
+      }
+    } else if (chunks.length) {
       ragContext = chunks.map((c, i) => `[${i + 1}] ${c}`).join('\n');
-      const contextScan = await screenContext(ragContext, { userId, requestId, persona, apiKey: lakeraKey, projectId });
-      if (contextScan.flagged) ragContext = '';
-      else usedRag = true;
+      usedRag = true;
     }
   }
   let systemPromptBase = buildSystemPrompt(persona, ragContext);
@@ -432,16 +729,41 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Model request failed' }, { status: 502 });
   }
 
-  const outputScan =
-    securityMode && lakeraOutputEnabled !== 'false'
-      ? await screenOutput(result.content, {
-          userId: userId ?? undefined,
-          requestId,
-          persona,
-          apiKey: lakeraKey,
-          projectId,
-        })
-      : noOpScan;
+  // (4) LLM_OUTPUT screening
+  let outputScan: ScanLike = noOpScan;
+  let finalContent = result.content;
+  if (securityMode && lakeraOutputEnabled !== 'false') {
+    const outputDecision = await screenText({
+      stage: 'LLM_OUTPUT',
+      text: result.content,
+      userId: userId ?? undefined,
+      correlationId,
+      apiKey: lakeraKey,
+      projectId,
+    });
+    await logSecurityEvent({
+      correlationId,
+      userId: userId ?? 'anonymous',
+      stage: 'LLM_OUTPUT',
+      action: outputDecision.action,
+      reasonCodes: outputDecision.reasonCodes,
+      redactedPreview: outputDecision.redactedText?.slice(0, 200),
+      lakeraAvailable: !outputDecision.reasonCodes.includes('lakera_unavailable'),
+      modelUsed: result.model,
+    });
+    outputScan = {
+      flagged: outputDecision.action === 'block',
+      normalizedCategories: outputDecision.reasonCodes,
+      severity: severityFromReasonCodes(outputDecision.reasonCodes),
+      raw: (outputDecision.raw as Record<string, unknown>) ?? {},
+      requestId: (outputDecision.raw as { request_uuid?: string })?.request_uuid,
+    };
+    if (outputDecision.action === 'block') {
+      finalContent = "I'm sorry, I can't provide that response. Please ask about your accounts or our products (credit cards, mortgages, auto loans).";
+    } else if (outputDecision.action === 'mask' && outputDecision.redactedText) {
+      finalContent = outputDecision.redactedText;
+    }
+  }
 
   const allCategories = Array.from(new Set([...inputScan.normalizedCategories, ...outputScan.normalizedCategories]));
   const inputScore = Array.isArray((inputScan.raw as { breakdown?: Array<{ risk_score?: number }> })?.breakdown)
@@ -459,14 +781,16 @@ export async function POST(request: Request) {
     contextual: 'none',
   });
 
-  let finalContent = result.content;
   let safeRewrite = false;
   let actionTaken: string = 'allowed';
-
-  if (securityMode && (outputScan.flagged && thresholdOrder(outputScan.severity) >= thresholdOrder(SAFE_REWRITE_THRESHOLD))) {
-    safeRewrite = true;
-    actionTaken = 'safe_rewrite';
-    finalContent = "I'm sorry, I can't provide that response. Please ask about your accounts or our products (credit cards, mortgages, auto loans).";
+  if (securityMode && (outputScan.flagged || (outputScan.normalizedCategories.length > 0 && outputScan.severity !== 'low'))) {
+    if (outputScan.flagged || thresholdOrder(outputScan.severity) >= thresholdOrder(SAFE_REWRITE_THRESHOLD)) {
+      safeRewrite = true;
+      actionTaken = 'safe_rewrite';
+      if (outputScan.flagged) {
+        finalContent = "I'm sorry, I can't provide that response. Please ask about your accounts or our products (credit cards, mortgages, auto loans).";
+      }
+    }
   }
 
   await prisma.chatAudit.create({
@@ -516,7 +840,8 @@ export async function POST(request: Request) {
     riskScore: score,
     riskLevel: level,
     categories: allCategories,
-    requestId,
+    requestId: correlationId,
+    correlationId,
   };
   if (snapshotHash) resPayload.snapshotHash = snapshotHash;
   if (toolsUsed.length) resPayload.toolsUsed = toolsUsed;

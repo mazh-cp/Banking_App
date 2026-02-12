@@ -8,6 +8,7 @@ import {
   getRecentTransactions,
   getCreditProfile,
   requestCreditIncrease,
+  transferFunds,
   computeSnapshotHash,
   type Balances,
   type RecentTransaction,
@@ -18,7 +19,8 @@ export type ToolName =
   | 'banking.getBalances'
   | 'banking.getRecentTransactions'
   | 'banking.getCreditProfile'
-  | 'banking.requestCreditIncrease';
+  | 'banking.requestCreditIncrease'
+  | 'banking.transferFunds';
 
 export type ToolResult = {
   tool: ToolName;
@@ -32,10 +34,17 @@ export type ToolResult = {
 /**
  * Run a banking tool. userId must come from session only, never from client.
  */
+export type ToolArgs = {
+  amount?: number;
+  reason?: string;
+  fromAccount?: string;
+  toAccount?: string;
+};
+
 export async function runBankingTool(
   tool: ToolName,
   userId: string,
-  args?: { amount?: number; reason?: string }
+  args?: ToolArgs
 ): Promise<ToolResult> {
   try {
     switch (tool) {
@@ -76,6 +85,18 @@ export async function runBankingTool(
           data,
         };
       }
+      case 'banking.transferFunds': {
+        const fromAccount = args?.fromAccount ?? 'checking';
+        const toAccount = args?.toAccount ?? 'savings';
+        const amount = args?.amount ?? 0;
+        const data = await transferFunds(userId, fromAccount, toAccount, amount);
+        return {
+          tool: 'banking.transferFunds',
+          success: true,
+          data,
+          asOf: data.postedAt,
+        };
+      }
       default:
         return { tool, success: false, error: 'Unknown tool' };
     }
@@ -105,6 +126,10 @@ export const BANKING_TOOL_SCHEMAS = {
   'banking.requestCreditIncrease': {
     description: 'Submit a simulated credit limit increase request. Requires amount and reason.',
     params: [{ name: 'amount', type: 'number' }, { name: 'reason', type: 'string' }],
+  },
+  'banking.transferFunds': {
+    description: 'Transfer funds between the user’s own accounts (checking, savings). Requires fromAccount, toAccount, amount. Only after user confirmation.',
+    params: [{ name: 'fromAccount', type: 'string' }, { name: 'toAccount', type: 'string' }, { name: 'amount', type: 'number' }],
   },
 } as const;
 

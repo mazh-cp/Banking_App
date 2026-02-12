@@ -15,6 +15,8 @@ type Message = {
   dataAsOf?: string;
   usedRag?: boolean;
   meta?: { systemGenerated?: boolean; type?: string };
+  pendingActionId?: string;
+  pendingActionSummary?: { type: string; fromAccount?: string; toAccount?: string; amount?: number; increaseAmount?: number; newLimit?: number };
 };
 
 const GREETING_STORAGE_KEY = 'finguard_chat_hasGreeted';
@@ -38,6 +40,44 @@ function getInitials(name: string): string {
   return (t[0] ?? '?').toUpperCase();
 }
 
+const URL_REGEX = /https?:\/\/[^\s<>"{}|\\^`[\]]+/gi;
+function domainFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+/** Render assistant content with unknown-link defense: URLs not in allowlist are plain text + "Unverified link". */
+function SafeMessageContent({ content, allowedDomains }: { content: string; allowedDomains: string[] }) {
+  const allowed = new Set(allowedDomains.map((d) => d.toLowerCase()));
+  const parts: (string | React.ReactNode)[] = [];
+  let lastIndex = 0;
+  const re = new RegExp(URL_REGEX.source, 'gi');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    const url = m[0];
+    const index = m.index;
+    if (index > lastIndex) parts.push(content.slice(lastIndex, index));
+    const domain = domainFromUrl(url);
+    if (domain && allowed.has(domain)) {
+      parts.push(<a key={index} href={url} target="_blank" rel="noopener noreferrer" className="text-bank-primary underline">{url}</a>);
+    } else {
+      parts.push(
+        <span key={index} className="inline-flex flex-col">
+          <span className="text-slate-600">{url}</span>
+          <span className="text-xs text-amber-700">Unverified link</span>
+        </span>
+      );
+    }
+    lastIndex = index + url.length;
+  }
+  if (lastIndex < content.length) parts.push(content.slice(lastIndex));
+  if (parts.length === 0) return <>{content}</>;
+  return <>{parts.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : <span key={i}>{p}</span>))}</>;
+}
+
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -56,8 +96,33 @@ export default function ChatPage() {
   const [verificationRequired, setVerificationRequired] = useState(false);
   /** When set, user is verified; show "Verified ✅ (expires at ...)" until this time passes. */
   const [verifiedExpiresAt, setVerifiedExpiresAt] = useState<string | null>(null);
+  const [allowedDomains, setAllowedDomains] = useState<string[]>([]);
+  const [confirmingActionId, setConfirmingActionId] = useState<string | null>(null);
   const greetingInjected = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  const handleConfirmAction = async (actionId: string, confirm: boolean) => {
+    setConfirmingActionId(actionId);
+    try {
+      const res = await fetch('/api/chat/confirm-action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actionId, confirm }),
+      });
+      const data = await res.json().catch(() => ({}));
+      const resultMessage = data.message ?? (confirm ? 'Action completed.' : 'Request cancelled.');
+      setMessages((prev) => {
+        const next = prev.map((m) =>
+          m.pendingActionId === actionId ? { ...m, pendingActionId: undefined, pendingActionSummary: undefined } : m
+        );
+        return [...next, { role: 'assistant' as const, content: resultMessage }];
+      });
+    } catch {
+      setMessages((m) => [...m, { role: 'assistant', content: 'Could not complete. Please try again.' }]);
+    } finally {
+      setConfirmingActionId(null);
+    }
+  };
 
   // Fetch current user for display name and conversation id
   useEffect(() => {
@@ -86,6 +151,31 @@ export default function ChatPage() {
       })
       .catch(() => {});
   }, []);
+
+  // Allowed domains for unknown-link UX (render unverified links as plain text)
+  useEffect(() => {
+    fetch('/api/config/allowed-domains')
+      .then((res) => res.ok ? res.json() : null)
+      .then((data) => data?.allowedDomains && Array.isArray(data.allowedDomains) && setAllowedDomains(data.allowedDomains))
+      .catch(() => {});
+  }, []);
+
+  // SSN-first: fetch verification status on chat load so verification step shows immediately
+  useEffect(() => {
+    if (!userId) return;
+    fetch('/api/chat/verification-status')
+      .then((res) => res.ok ? res.json() : null)
+      .then((data) => {
+        if (!data) return;
+        if (data.verificationRequired === true) {
+          setVerificationRequired(true);
+        } else {
+          setVerificationRequired(false);
+          if (data.verifiedExpiresAt) setVerifiedExpiresAt(data.verifiedExpiresAt);
+        }
+      })
+      .catch(() => {});
+  }, [userId]);
 
   // Inject greeting once per user when conversation is empty
   useEffect(() => {
@@ -161,6 +251,8 @@ export default function ChatPage() {
         verificationRequired?: boolean;
         verificationNotConfigured?: boolean;
         verificationSuccess?: boolean;
+        pendingActionId?: string;
+        pendingActionSummary?: { type: string; fromAccount?: string; toAccount?: string; amount?: number; increaseAmount?: number; newLimit?: number };
       };
       try {
         data = await res.json();
@@ -210,6 +302,8 @@ export default function ChatPage() {
           safeRewrite: data.safeRewrite,
           dataAsOf: data.dataAsOf,
           usedRag: data.usedRag,
+          pendingActionId: data.pendingActionId,
+          pendingActionSummary: data.pendingActionSummary,
         },
       ]);
       setMaintenanceBanner(null);
@@ -375,7 +469,11 @@ export default function ChatPage() {
                       : 'bg-slate-100 text-slate-800'
                   }`}
                 >
-                  {m.content}
+                  {m.role === 'assistant' ? (
+                    <SafeMessageContent content={m.content} allowedDomains={allowedDomains} />
+                  ) : (
+                    m.content
+                  )}
                   {m.blocked && (
                     <span className="block mt-1 text-xs font-medium text-amber-800">
                       Security policy enforced
@@ -395,6 +493,29 @@ export default function ChatPage() {
                     <span className="block mt-1 text-xs text-slate-500">
                       Answered using your documents
                     </span>
+                  )}
+                  {m.role === 'assistant' && m.pendingActionId && m.pendingActionSummary && (
+                    <div className="mt-3 p-3 rounded-lg bg-amber-50 border border-amber-200">
+                      <p className="text-xs font-medium text-amber-800 mb-2">Confirm or cancel</p>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleConfirmAction(m.pendingActionId!, true)}
+                          disabled={confirmingActionId === m.pendingActionId}
+                          className="px-3 py-1.5 text-sm font-medium rounded-lg bg-green-600 text-white hover:bg-green-700 disabled:opacity-50"
+                        >
+                          {confirmingActionId === m.pendingActionId ? '…' : 'Confirm'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleConfirmAction(m.pendingActionId!, false)}
+                          disabled={confirmingActionId === m.pendingActionId}
+                          className="px-3 py-1.5 text-sm font-medium rounded-lg bg-slate-200 text-slate-800 hover:bg-slate-300 disabled:opacity-50"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
                   )}
                 </div>
               </div>

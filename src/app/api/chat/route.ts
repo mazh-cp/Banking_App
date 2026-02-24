@@ -10,7 +10,7 @@ import { requireSession } from '@/lib/auth';
 import {
   screenText,
   screenMessages,
-  optionallyExplain,
+  screenOutputHolistic,
   severityFromReasonCodes,
 } from '@/lib/security/lakera-guard';
 import type { LakeraDecision } from '@/lib/security/lakera-types';
@@ -50,6 +50,8 @@ import { formatTrustedToolOutput } from '@/lib/chat/promptParts';
 import { getCreditProfile, type Balances } from '@/lib/banking/banking-service';
 import { computeCreditIncreaseEligibility } from '@/lib/banking/eligibility';
 import { hasBalanceMismatch } from '@/lib/security/balance-verification';
+import { containsObviousJailbreak } from '@/lib/security/jailbreak-patterns';
+import { safeLog } from '@/lib/security/secure-logger';
 
 const MAINTENANCE_MESSAGE = 'System is under Maintenance';
 const REQUIRE_LAKERA_ALWAYS = process.env.REQUIRE_LAKERA_ALWAYS === 'true';
@@ -202,8 +204,6 @@ export async function POST(request: Request) {
 
   // (1) USER_INPUT screening — single gateway lib/security/lakera-guard
   // apiKey/projectId from getSecret/getConfig override env (Admin-stored keys when set).
-  // Keep last input decision in scope so we can store LakeraEvidence and optionallyExplain on block.
-  let lastInputDecision: LakeraDecision | null = null;
   let effectiveUserContent = userContent;
   let inputScan: ScanLike = noOpScan;
   if (securityMode && lakeraInputEnabled !== 'false') {
@@ -216,7 +216,6 @@ export async function POST(request: Request) {
       apiKey: lakeraKey,
       projectId,
     });
-    lastInputDecision = inputDecision;
     await logSecurityEvent({
       correlationId,
       userId: userId ?? 'anonymous',
@@ -252,6 +251,59 @@ export async function POST(request: Request) {
     inputScan.flagged &&
     (thresholdOrder(inputScan.severity) >= thresholdOrder(BLOCK_THRESHOLD) ||
       inputScan.normalizedCategories.some((c) => blockCategories.includes(c)));
+
+  // Defense-in-depth: block obvious jailbreak/cross-user phrases even if Lakera allows
+  if (securityMode && containsObviousJailbreak(userContent)) {
+    const { score, level } = computeRiskScore({
+      normalizedCategories: ['app_pattern_block'],
+      inputSeverity: 'high',
+      contextual: 'none',
+    });
+    await prisma.chatAudit.create({
+      data: {
+        requestId: correlationId,
+        userId,
+        sessionId: userId,
+        persona,
+        role: 'user',
+        contentPreview: redactForAuditPreview(effectiveUserContent),
+        inputScanResult: { source: 'app_pattern_block' },
+        riskScore: score,
+        riskLevel: level,
+        categories: ['app_pattern_block'] as unknown as object,
+        actionTaken: 'blocked',
+        blocked: true,
+        modelUsed: null,
+        provider: null,
+        attackSimulation,
+        securityMode,
+      },
+    });
+    await prisma.auditEvent.create({
+      data: {
+        eventType: 'CHAT_BLOCKED_LAKERA',
+        userId,
+        actorUserId: userId,
+        sessionId: userId,
+        route: '/api/chat',
+        riskLevel: level,
+        riskScore: score,
+        actionTaken: 'BLOCK',
+        provider,
+        persona,
+        metadata: { requestId: correlationId, source: 'app_pattern_block' },
+      },
+    });
+    return NextResponse.json({
+      ok: false,
+      blocked: true,
+      message: "I can't help with that request. Try rephrasing or ask a banking question like balance, transfers, payments.",
+      requestId: correlationId,
+      riskLevel: level,
+      riskScore: score,
+      categories: ['app_pattern_block'],
+    }, { status: 400 });
+  }
 
   if (shouldBlockLakera) {
     const { score, level } = computeRiskScore({
@@ -297,26 +349,7 @@ export async function POST(request: Request) {
         metadata: { requestId: correlationId },
       },
     });
-    if (lastInputDecision && inputScan.requestId && lakeraKey) {
-      await optionallyExplain(lastInputDecision, lakeraKey);
-      if (lastInputDecision.results != null) {
-        const results = lastInputDecision.results as Record<string, unknown>;
-        const summary = results.summary ?? results;
-        const detectors = results.breakdown ?? results.detectors;
-        try {
-          await prisma.lakeraEvidence.create({
-            data: {
-              auditEventId: auditEvent.id,
-              requestId: inputScan.requestId,
-              summaryJson: (summary ?? results) as object,
-              ...(detectors != null && { detectorsJson: detectors as object }),
-            },
-          });
-        } catch {
-          // non-fatal
-        }
-      }
-    }
+    // /guard/results is not used in runtime; use scripts/lakera-calibration.ts for calibration only.
     return NextResponse.json({
       ok: false,
       blocked: true,
@@ -753,13 +786,18 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Model request failed' }, { status: 502 });
   }
 
-  // (4) LLM_OUTPUT screening
+  // (4) Holistic LLM_OUTPUT screening (conversation + tool args + tool output + RAG) before returning
   let outputScan: ScanLike = noOpScan;
   let finalContent = result.content;
   if (securityMode && lakeraOutputEnabled !== 'false') {
-    const outputDecision = await screenText({
-      stage: 'LLM_OUTPUT',
-      text: result.content,
+    const conversationSummary = chatMessages.slice(-4).map((m) => `${m.role}: ${m.content.slice(0, 500)}`).join('\n');
+    const toolArgsSummary = toolsUsed.length ? `Tools used: ${toolsUsed.join(', ')}` : '';
+    const outputDecision = await screenOutputHolistic({
+      assistantContent: result.content,
+      conversationSummary,
+      toolArgsSummary,
+      toolOutputSummary: toolContext.slice(0, 6000),
+      ragContent: ragContext.slice(0, 4000),
       userId: userId ?? undefined,
       correlationId,
       apiKey: lakeraKey,
@@ -790,7 +828,7 @@ export async function POST(request: Request) {
   }
 
   if (toolsUsed.includes('banking.getBalances') && authoritativeBalances && hasBalanceMismatch(finalContent, authoritativeBalances)) {
-    console.warn(`[${correlationId}] Balance mismatch detected: LLM output may contain hallucinated numbers`);
+    safeLog('warn', `Balance mismatch detected: LLM output may contain hallucinated numbers`, { correlationId });
     finalContent = "I'm sorry, I couldn't verify those numbers. Please check your dashboard for current balances.";
   }
 
@@ -816,10 +854,8 @@ export async function POST(request: Request) {
     if (outputScan.flagged || thresholdOrder(outputScan.severity) >= thresholdOrder(SAFE_REWRITE_THRESHOLD)) {
       safeRewrite = true;
       actionTaken = 'safe_rewrite';
-      // Only replace content when input or output was actually blocked/flagged, so legitimate balance/account answers are not overwritten
-      if (outputScan.flagged || inputScan.flagged) {
-        finalContent = "I'm sorry, I can't provide that response. Please ask about your accounts or our products (credit cards, mortgages, auto loans).";
-      }
+      // Always replace content when we mark as safe_rewrite so the user never sees potentially unsafe output (e.g. after jailbreak attempts).
+      finalContent = "I'm sorry, I can't provide that response. Please ask about your accounts or our products (credit cards, mortgages, auto loans).";
     }
   }
 

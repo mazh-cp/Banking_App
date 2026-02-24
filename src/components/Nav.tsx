@@ -23,6 +23,7 @@ export default function Nav({ role = 'customer' }: { role?: string }) {
 
   const adminLinks = [
     { href: '/admin/settings', label: 'Settings' },
+    { href: '/admin/accounts', label: 'Accounts' },
     { href: '/admin/architecture', label: 'Architecture' },
     { href: '/admin/activity', label: 'Activity' },
     { href: '/admin/security-warnings', label: 'Security Warnings' },

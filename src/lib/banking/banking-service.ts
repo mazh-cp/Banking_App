@@ -298,6 +298,63 @@ export async function transferFunds(
 }
 
 /**
+ * Admin-only: top up an account (credit). Creates a transaction and updates balance.
+ * @param userId - owner of the account
+ * @param accountIdOrType - account id (cuid) or type 'checking' | 'savings'
+ * @param amount - amount to add (positive number)
+ * @param adminUserId - admin performing the action (for audit)
+ */
+export async function adminTopUpAccount(
+  userId: string,
+  accountIdOrType: string,
+  amount: number,
+  adminUserId: string
+): Promise<{ success: boolean; accountId: string; newBalance: number; transactionId: string; error?: string }> {
+  if (amount <= 0) {
+    return { success: false, accountId: '', newBalance: 0, transactionId: '', error: 'Amount must be positive' };
+  }
+  let account = null;
+  if (accountIdOrType === 'checking' || accountIdOrType === 'savings') {
+    account = await prisma.account.findFirst({
+      where: { userId, type: accountIdOrType, status: 'active' },
+    });
+  } else {
+    account = await prisma.account.findFirst({
+      where: { id: accountIdOrType, userId, status: 'active' },
+    });
+  }
+  if (!account) {
+    return { success: false, accountId: '', newBalance: 0, transactionId: '', error: 'Account not found' };
+  }
+  const reference = `admin-topup-${Date.now()}-${createHash('sha256').update(adminUserId + account.id + amount).digest('hex').slice(0, 8)}`;
+  const result = await prisma.$transaction(async (tx) => {
+    await tx.account.update({
+      where: { id: account!.id },
+      data: { balance: { increment: amount } },
+    });
+    const t = await tx.transaction.create({
+      data: {
+        userId,
+        fromAccountId: null,
+        toAccountId: account!.id,
+        type: 'admin_topup',
+        amount,
+        description: `Admin top-up by ${adminUserId}`,
+        reference,
+      },
+    });
+    const updated = await tx.account.findUnique({ where: { id: account!.id } });
+    return { transaction: t, newBalance: updated ? Number(updated.balance) : 0 };
+  });
+  return {
+    success: true,
+    accountId: account.id,
+    newBalance: result.newBalance,
+    transactionId: result.transaction.id,
+  };
+}
+
+/**
  * Compute a snapshot hash for correlation: dashboard and chat use the same formula.
  * snapshotHash = sha256(JSON.stringify(balances) + timestampBucket).
  * timestampBucket = floor(now / 300000) * 300000 (5-minute bucket in ms).

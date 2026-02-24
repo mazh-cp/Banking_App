@@ -7,7 +7,7 @@
 import OpenAI from 'openai';
 
 const LITELLM_PROXY_URL = process.env.LITELLM_PROXY_URL?.replace(/\/$/, '');
-const LITELLM_API_KEY = process.env.LITELLM_API_KEY || process.env.OPENAI_API_KEY || 'sk-1234';
+const LITELLM_API_KEY = process.env.LITELLM_API_KEY || process.env.OPENAI_API_KEY || '';
 const DEFAULT_EMBEDDING_MODEL = process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small';
 const LITELLM_EMBEDDING_MODEL = process.env.LITELLM_EMBEDDING_MODEL || DEFAULT_EMBEDDING_MODEL;
 

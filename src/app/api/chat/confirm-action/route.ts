@@ -75,6 +75,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Could not confirm action' }, { status: 400 });
   }
 
+  // Tool args are built only from stored PendingAction payload (server-authoritative). Propose → confirm → execute.
   const payload = action.payload as { fromAccount?: string; toAccount?: string; amount?: number; increaseAmount?: number };
   const correlationId = `confirm-${Date.now()}`;
   const [lakeraKey, projectId] = await Promise.all([

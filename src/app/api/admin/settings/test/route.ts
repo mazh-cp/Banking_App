@@ -59,10 +59,10 @@ export async function POST(request: Request) {
       if (!key) {
         message = 'Lakera API key not set';
       } else {
-        const res = await fetch('https://api.lakera.ai/v1/guard', {
+        const res = await fetch('https://api.lakera.ai/v2/guard', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-          body: JSON.stringify({ input: 'What is the weather?' }),
+          body: JSON.stringify({ messages: [{ role: 'user', content: 'What is the weather?' }] }),
         });
         success = res.ok;
         message = res.ok ? 'Guard responded OK' : `HTTP ${res.status}`;

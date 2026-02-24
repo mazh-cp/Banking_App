@@ -15,7 +15,7 @@ export interface LakeraDecision {
   projectId?: string;
   /** Only minimal metadata; never raw prompt/PII */
   raw?: Record<string, unknown>;
-  /** From /guard/results when optionallyExplain enabled */
+  /** From /guard/results in calibration script only (not used in runtime). */
   results?: unknown;
   /** True when mode is "monitor" and action was converted from block to allow (do not auto-execute e.g. TOOL_ARGS). */
   wouldHaveBeenBlocked?: boolean;

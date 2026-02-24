@@ -9,7 +9,7 @@ const ANTHROPIC_MODEL = process.env.CHAT_MODEL_ANTHROPIC || 'claude-3-5-sonnet-2
 /** When set, all chat goes through LiteLLM proxy (OpenAI-compatible). Enables load balancing, cost tracking, fallback. */
 const LITELLM_PROXY_URL = process.env.LITELLM_PROXY_URL?.replace(/\/$/, '');
 const LITELLM_CHAT_MODEL = process.env.LITELLM_CHAT_MODEL || OPENAI_MODEL;
-const LITELLM_API_KEY = process.env.LITELLM_API_KEY || process.env.OPENAI_API_KEY || 'sk-1234';
+const LITELLM_API_KEY = process.env.LITELLM_API_KEY || process.env.OPENAI_API_KEY || '';
 
 const CHAT_RETRY_ATTEMPTS = 1;
 const CHAT_RETRY_DELAY_MS = 1000;

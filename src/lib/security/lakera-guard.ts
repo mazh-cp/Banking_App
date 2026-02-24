@@ -354,23 +354,23 @@ export async function screenMessages(params: ScreenMessagesParams): Promise<Lake
   return decision;
 }
 
-/** Fetch /guard/results for admin explainability. Do not expose to end-user. */
-export async function optionallyExplain(
-  decision: LakeraDecision,
+/**
+ * Fetch /guard/results by request_id. NOT used in runtime path.
+ * Use only in calibration/evaluation scripts (see scripts/lakera-calibration.ts).
+ */
+export async function fetchGuardResultsForCalibration(
+  requestId: string,
   apiKey?: string | null
-): Promise<LakeraDecision> {
-  const requestId = decision.raw?.request_uuid as string | undefined;
-  if (!requestId) return decision;
+): Promise<unknown> {
   const key = apiKey ?? lakeraConfig.apiKey;
-  if (!key) return decision;
+  if (!key) return null;
   try {
     const url = `${lakeraConfig.baseUrl.replace(/\/$/, '')}/guard/results?request_id=${encodeURIComponent(requestId)}`;
     const res = await fetch(url, { headers: { Authorization: `Bearer ${key}` } });
-    if (res.ok) decision.results = await res.json();
+    return res.ok ? res.json() : null;
   } catch {
-    // non-fatal
+    return null;
   }
-  return decision;
 }
 
 /** Derive severity from reason codes for audit/risk. */
@@ -382,6 +382,121 @@ export function severityFromReasonCodes(reasonCodes: string[]): 'low' | 'medium'
     if (med.some((m) => c.toLowerCase().includes(m))) return 'medium';
   }
   return reasonCodes.length > 0 ? 'medium' : 'low';
+}
+
+export type ScreenOutputHolisticParams = {
+  assistantContent: string;
+  conversationSummary?: string;
+  toolArgsSummary?: string;
+  toolOutputSummary?: string;
+  ragContent?: string;
+  userId?: string | null;
+  correlationId: string;
+  apiKey?: string | null;
+  projectId?: string | null;
+};
+
+/**
+ * Holistic screening of assistant output before returning to client.
+ * Sends conversation context, tool args summary, tool output summary, and RAG content so Guard can make a runtime decision with full context.
+ */
+export async function screenOutputHolistic(params: ScreenOutputHolisticParams): Promise<LakeraDecision> {
+  const {
+    assistantContent,
+    conversationSummary = '',
+    toolArgsSummary = '',
+    toolOutputSummary = '',
+    ragContent = '',
+    userId,
+    correlationId,
+    apiKey: overrideKey,
+    projectId: overrideProjectId,
+  } = params;
+  const apiKey = overrideKey ?? lakeraConfig.apiKey;
+  const projectId = overrideProjectId ?? lakeraConfig.projectId;
+  const decision: LakeraDecision = {
+    action: 'allow',
+    reasonCodes: [],
+    correlationId,
+    projectId: projectId || undefined,
+  };
+  if (lakeraConfig.mode === 'off') {
+    decision.reasonCodes = ['lakera_off'];
+    return decision;
+  }
+  if (!apiKey) {
+    if (lakeraConfig.failOpen) {
+      decision.reasonCodes.push('lakera_unavailable');
+      return decision;
+    }
+    decision.action = 'mask';
+    decision.reasonCodes.push('lakera_unavailable');
+    decision.redactedText = "I'm sorry, I can't provide that response. Please try again.";
+    return decision;
+  }
+  const contextParts: string[] = [];
+  if (conversationSummary) contextParts.push(`Conversation context:\n${conversationSummary.slice(0, 4000)}`);
+  if (toolArgsSummary) contextParts.push(`Tool args summary:\n${toolArgsSummary.slice(0, 2000)}`);
+  if (toolOutputSummary) contextParts.push(`Tool output summary:\n${toolOutputSummary.slice(0, 6000)}`);
+  if (ragContent) contextParts.push(`RAG content:\n${ragContent.slice(0, 4000)}`);
+  const userContext = contextParts.length ? contextParts.join('\n\n') : '(no additional context)';
+  const messages: { role: string; content: string }[] = [
+    { role: 'user', content: userContext },
+    { role: 'assistant', content: assistantContent.slice(0, 32000) },
+  ];
+  const body: GuardPayload = {
+    messages,
+    breakdown: true,
+  };
+  if (projectId) body.project_id = projectId;
+  if (userId) body.metadata = { user_id: userId };
+  const { data, error } = await callGuard(body, apiKey, lakeraConfig.baseUrl);
+  if (error || !data) {
+    if (lakeraConfig.failOpen) {
+      decision.reasonCodes.push('lakera_unavailable');
+      return decision;
+    }
+    decision.action = 'mask';
+    decision.reasonCodes.push('lakera_unavailable');
+    decision.redactedText = "I'm sorry, I can't provide that response. Please try again.";
+    decision.raw = { error: (error ?? 'unknown').slice(0, 100) };
+    return decision;
+  }
+  const reasonCodes = reasonCodesFromResponse(data);
+  decision.reasonCodes = reasonCodes;
+  decision.raw = { request_uuid: data.metadata?.request_uuid, flagged: data.flagged };
+  let action: LakeraAction = 'allow';
+  if (data.flagged) {
+    action = 'block';
+    if (data.breakdown?.some((b) => (b.detector_type ?? '').toLowerCase().includes('pii') || (b.detector_type ?? '').toLowerCase().includes('redact'))) {
+      action = 'mask';
+    }
+  }
+  if (lakeraConfig.mode === 'monitor' && action === 'block') {
+    decision.wouldHaveBeenBlocked = true;
+    action = 'allow';
+  }
+  decision.action = action;
+  if (action === 'mask' && data.flagged && !decision.redactedText) {
+    decision.redactedText = redactForAuditPreview(assistantContent, 500).slice(0, 2000) || '(redacted)';
+  }
+  return decision;
+}
+
+/**
+ * Screen a user/assistant interaction (conversation). Uses /v2/guard with metadata.
+ * API key from env (LAKERA_GUARD_API_KEY / LAKERA_API_KEY). Server-only.
+ */
+export async function screenInteraction(params: ScreenMessagesParams): Promise<LakeraDecision> {
+  return screenMessages({ ...params, stage: 'USER_INPUT' });
+}
+
+/**
+ * Screen serialized tool arguments before execution. Uses /v2/guard with metadata.
+ * API key from env. Server-only. Call before executing transfer/credit actions.
+ */
+export async function screenToolArgs(params: Omit<ScreenTextParams, 'stage'>): Promise<LakeraDecision> {
+  return screenText({ ...params, stage: 'TOOL_ARGS' });
 }
 
 // Re-export for consumers that need stage/types

@@ -45,9 +45,10 @@ export type ExecuteToolSafelyParams = {
 };
 
 /**
+ * Propose → confirm → execute. Tool args must come from stored PendingAction payload (confirm-action) or allowed schema only.
  * 1) Verify tool in allowlist
  * 2) Verify step-up auth (SSN4) for sensitive tools
- * 3) Lakera TOOL_ARGS screen
+ * 3) Lakera TOOL_ARGS screen (screenToolArgs) before executing transfer/credit
  * 4) Execute tool
  */
 export async function executeToolSafely(params: ExecuteToolSafelyParams): Promise<ToolResult> {

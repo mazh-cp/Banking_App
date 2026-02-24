@@ -59,6 +59,14 @@ Optional: skip AppSec steps if tools not installed:
 
 - Set `USE_DEMO_FINANCE_DATA=true` and run `pnpm run db:init`, then `pnpm run import:finance` with the seed zip in `data/seed/`.
 
+## Rate Limiting (Multi-Instance)
+
+The default rate limiter (`lib/rate-limit.ts`) uses an in-memory `Map`. Limits are per process; with multiple app instances (e.g. behind a load balancer), each instance tracks limits independently. For consistent, global limits:
+
+1. **Use Redis**: Set `REDIS_URL` and replace the in-memory store with a Redis-backed implementation (e.g. `ioredis` with a sliding-window or fixed-window counter per `identifier`).
+2. **Key isolation**: Chat uses `userId:chat`, upload uses `userId:upload`, confirm-action uses `confirm:userId`. Ensure Redis keys include a prefix (e.g. `finguard:rl:`) to avoid collisions.
+3. **TTL**: Align TTL with `RATE_LIMIT_REQUESTS_PER_MINUTE` window (e.g. 60 seconds).
+
 ## Logging and Audit
 
 - Application logs: use secure logger (redacts PII). Audit events are stored in `AuditEvent` and `ChatAudit`; do not log raw API keys or SSN.

@@ -15,7 +15,7 @@
 ## Secure Chat
 
 - Choose a **persona** (Support, Underwriter, Fraud analyst) and type your question.
-- **Security mode** (on by default) screens your messages and the assistant’s replies for safety.
+- **Security mode** (on by default) screens your messages and the assistant’s replies for safety. Links in replies from unknown domains are shown as plain text with an “Unverified link” label.
 - For **balance or transaction** questions you may be asked to **verify** with the last 4 digits of your SSN (simulation). Enter the 4 digits in the chat when prompted.
 - **RAG (Use RAG)** uses your approved uploaded documents to answer; enable the checkbox if you have documents on file.
 

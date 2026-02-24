@@ -1,7 +1,11 @@
 import { prisma } from './db';
-import OpenAI from 'openai';
+import { getEmbeddingClient, getEmbeddingModel } from './llm-embedding-client';
 
-const EMBEDDING_MODEL = process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small';
+/**
+ * RAG invariant: No unscanned chunk is used in RAG.
+ * File upload chunks are screened via screenText (Lakera v2) before embedding and indexing.
+ * Finance chunks are built from authoritative DB data and do not contain user-uploaded content.
+ */
 const SIMILARITY_TOP_K = 5;
 
 export type GetRelevantChunksOptions = {
@@ -23,13 +27,13 @@ export async function getRelevantChunks(
   options: GetRelevantChunksOptions = {}
 ): Promise<string[]> {
   const { includeFinance = true, openaiApiKey } = options;
-  const apiKey = openaiApiKey ?? process.env.OPENAI_API_KEY;
+  const apiKey = openaiApiKey ?? process.env.OPENAI_API_KEY ?? (process.env.LITELLM_PROXY_URL ? process.env.LITELLM_API_KEY : null);
   const ragDisabled = process.env.RAG_ENABLED === 'false';
   if (!apiKey || ragDisabled) return [];
 
-  const openai = new OpenAI({ apiKey });
-  const embeddingRes = await openai.embeddings.create({
-    model: EMBEDDING_MODEL,
+  const client = getEmbeddingClient(apiKey);
+  const embeddingRes = await client.embeddings.create({
+    model: getEmbeddingModel(),
     input: query.slice(0, 8000),
   });
   const queryEmbedding = embeddingRes.data[0]?.embedding;

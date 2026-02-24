@@ -65,6 +65,7 @@ The **Lakera Guard** security gateway is the single point for all screening and 
 - **Transfers and credit increases** require a verified user (SSN last-4), a **pending action** (created when the assistant proposes the action), and **explicit confirmation** (user replies YES or clicks Confirm). No action is executed via prompt injection alone.
 - **Pending actions** are stored in `PendingAction` with a short TTL (e.g. 10 minutes). Events `CHAT_ACTION_PROPOSED`, `CHAT_ACTION_CONFIRMED`, `CHAT_ACTION_EXECUTED`, `CHAT_ACTION_FAILED`, `CHAT_ACTION_CANCELLED`, `CHAT_ACTION_EXPIRED` are audited.
 - **Intent step (optional):** Set `CHAT_INTENT_ENABLED=true` to use an LLM-based intent classifier for balance/transactions/credit_profile/transfer_request/credit_increase_request. When disabled or low confidence, the existing regex-based tool selection is used as fallback.
+- **Transfer without intent:** When intent is off, transfer-like messages still trigger balance context and a helpful reply. If the user says "transfer 500 from checking to savings" (with amount), the regex path can create a transfer proposal directly. If they omit the amount, the assistant asks "How much would you like to transfer?" (clarification). With intent on, `transfer_request` with no amount also returns this clarification.
 - **Lakera gates:** USER_INPUT always; TOOL_ARGS for action tools (e.g. transferFunds, requestCreditIncrease); LLM_OUTPUT always. All blocks and confirmations are audited.
 
 ## Quick start
@@ -138,6 +139,8 @@ pnpm test
 - **RAG**: `RAG_ENABLED`, `OPENAI_EMBEDDING_MODEL`, `RAG_AUTO_APPROVE_LOW_MED`
 - **Uploads**: `UPLOAD_DIR`, `MAX_FILE_UPLOAD_BYTES`
 - **Limits**: `MAX_REQUEST_BODY_BYTES`, `MAX_CHAT_MESSAGE_LENGTH`, `RATE_LIMIT_REQUESTS_PER_MINUTE`
+- **Multi-instance rate limiting**: The built-in rate limiter uses an in-memory store. For horizontal scaling (multiple app instances), use a shared Redis store so rate limits apply across instances. Set `REDIS_URL` and configure the rate limiter to use Redis (see `docs/DEVOPS_GUIDE.md`).
+- **Optional – LiteLLM proxy**: For better performance (single gateway, load balancing, cost tracking, fallback across providers), run [LiteLLM](https://github.com/BerriAI/litellm) and set `LITELLM_PROXY_URL` (e.g. `http://localhost:4000`). Chat and embeddings then go through the proxy. Optional: `LITELLM_API_KEY`, `LITELLM_CHAT_MODEL`, `LITELLM_EMBEDDING_MODEL`. When unset, the app talks to OpenAI/Anthropic directly as before.
 
 ## Maintenance mode (missing AI keys)
 
@@ -169,3 +172,4 @@ Keys are read from Admin Settings (encrypted DB) first, then env (e.g. `.env`). 
 - **RAG**: Per-user finance docs under `data/rag/users/<user_id>/` (profile.md, accounts.md, transactions_12mo.md) indexed into `FinanceRagChunk` with metadata `docType: "finance"`. Retrieval scoped strictly by verified session userId; no cross-user retrieval.
 - **Lakera**: `lib/lakera-guard.ts` screens user prompt, retrieved context, and model output; all events logged to SQLite `chat_events`. `GET /api/admin/security-events` (admin-only) returns Lakera blocks/flags with optional filters.
 - **Finance Q&A**: Answers computed from DB first (balances, recent tx, totals); tool output injected as trusted context; RAG is supplemental only; LLM does not invent numbers.
+- **Dashboard vs chat**: Both use the same authoritative source (banking tools / DB). If a balance mismatch is detected between tool output and LLM response, the chat replaces the response with a safe message and logs a warning. No separate dashboard vs chat comparison logging is required.

@@ -53,13 +53,18 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
 /**
  * Pure check given a runtime config. Used by assertAiReady and by tests.
  */
+const LITELLM_PROXY_URL = process.env.LITELLM_PROXY_URL?.trim();
+const LITELLM_API_KEY = process.env.LITELLM_API_KEY?.trim();
+
 export function checkAiReadyFromConfig(
   config: RuntimeConfig,
   context: AiReadinessContext
 ): AssertAiReadyResult {
   const missing: string[] = [];
 
-  if (context.provider === 'openai') {
+  if (LITELLM_PROXY_URL && (LITELLM_API_KEY || config.openaiApiKey?.trim() || config.anthropicApiKey?.trim())) {
+    // LiteLLM proxy is configured with a key; no provider-specific key required
+  } else if (context.provider === 'openai') {
     if (!config.openaiApiKey?.trim()) missing.push('OPENAI_API_KEY');
   } else {
     if (!config.anthropicApiKey?.trim()) missing.push('ANTHROPIC_API_KEY');

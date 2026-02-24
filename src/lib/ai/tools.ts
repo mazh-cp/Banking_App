@@ -134,7 +134,7 @@ export const BANKING_TOOL_SCHEMAS = {
 } as const;
 
 /**
- * Detect if the user message is account-specific (balance, transactions, credit, limit).
+ * Detect if the user message is account-specific (balance, transactions, credit, limit, transfer).
  * Used to decide whether to run tools before the model.
  */
 export function isAccountSpecificQuery(content: string): boolean {
@@ -142,11 +142,22 @@ export function isAccountSpecificQuery(content: string): boolean {
   const patterns = [
     /\b(my|our)\s+(checking|savings|account|balance|balances)\b/,
     /\b(what'?s?|what is)\s+(my|the)\s+(balance|checking|savings|credit)/,
+    /\b(my|our|the)\s+current\s+balance\b/i,
+    /\bcurrent\s+balance\b/i,
     /\b(how much|balance)\s+(do i have|in my)/,
     /\b(credit\s*(limit|line|utilization)|available\s*credit)\b/,
     /\b(recent\s*)?transactions?\b/,
     /\b(increase\s*my\s*credit|credit\s*increase|raise\s*(my\s*)?limit)\b/,
     /\b(payment\s*history|utilization)\b/,
+    /\btransfer\s+(money|funds)?\s*(from|to|between)/i,
+    /\btransfer\b.*\b(checking|savings)\b/i,
   ];
   return patterns.some((p) => p.test(lower));
+}
+
+/**
+ * Detect if the message looks like a transfer request (for hints when intent is off).
+ */
+export function isTransferLike(content: string): boolean {
+  return /\btransfer\b/i.test(content);
 }

@@ -4,8 +4,9 @@
   "private": true,
   "scripts": {
     "dev": "next dev -p 5000",
+    "dev:clean": "rm -rf .next node_modules/.cache && next dev -p 5000",
     "build": "next build",
-    "test": "tsx tests/risk-scoring.test.ts && tsx tests/auth-rbac.test.ts && (tsx tests/upload-scan.test.ts 2>/dev/null || true) && (tsx tests/dashboard-chat-correlation.test.ts 2>/dev/null || true)",
+    "test": "tsx tests/risk-scoring.test.ts && tsx tests/auth-rbac.test.ts && (tsx tests/upload-scan.test.ts 2>/dev/null || true) && (tsx tests/dashboard-chat-correlation.test.ts 2>/dev/null || true) && (tsx tests/jailbreak-regression.spec.ts 2>/dev/null || true)",
     "test:unit": "tsx tests/risk-scoring.test.ts && tsx tests/auth-rbac.test.ts",
     "test:ledger": "tsx tests/ledger-integrity.test.ts",
     "start": "next start -p 5000",

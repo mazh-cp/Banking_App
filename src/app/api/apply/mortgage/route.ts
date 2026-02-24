@@ -1,6 +1,14 @@
 import { NextResponse } from 'next/server';
 import { requireSession } from '@/lib/auth';
 import { prisma } from '@/lib/db';
+import { z } from 'zod';
+
+const formSchema = z.object({
+  amount: z.string().max(50).optional(),
+  term: z.string().max(20).optional(),
+  property: z.string().max(500).optional(),
+  income: z.string().max(200).optional(),
+});
 
 export async function POST(request: Request) {
   try {
@@ -10,20 +18,23 @@ export async function POST(request: Request) {
       return NextResponse.redirect(new URL('/dashboard?error=readonly', base));
     }
     const form = await request.formData();
-    const amount = form.get('amount');
-    const term = form.get('term');
-    const property = form.get('property');
-    const income = form.get('income');
-    const termMonths = term ? parseInt(term.toString(), 10) * 12 : 360;
+    const raw = Object.fromEntries(Array.from(form.entries()).map(([k, v]) => [k, typeof v === 'string' ? v : '']));
+    const parsed = formSchema.safeParse(raw);
+    if (!parsed.success) {
+      return NextResponse.redirect(new URL('/dashboard?error=invalid_form', request.url));
+    }
+    const { amount: amountStr, term, property, income } = parsed.data;
+    const amount = amountStr ? parseFloat(amountStr) : 350000;
+    const termMonths = term ? parseInt(term, 10) * 12 : 360;
     await prisma.application.create({
       data: {
         userId: session.user.id,
         type: 'mortgage',
         status: 'pending',
-        amount: amount ? parseFloat(amount.toString()) : 350000,
+        amount: Number.isFinite(amount) ? amount : 350000,
         termMonths,
         rate: 6.5,
-        metadata: { propertyAddress: property?.toString(), income: income?.toString() },
+        metadata: { propertyAddress: property ?? undefined, income: income ?? undefined },
       },
     });
     return NextResponse.redirect(new URL('/dashboard?app=mortgage_submitted', request.url));

@@ -1,6 +1,12 @@
 import { NextResponse } from 'next/server';
 import { requireSession } from '@/lib/auth';
 import { prisma } from '@/lib/db';
+import { z } from 'zod';
+
+const formSchema = z.object({
+  income: z.string().max(200).optional(),
+  employment: z.string().max(200).optional(),
+});
 
 export async function POST(request: Request) {
   try {
@@ -10,15 +16,19 @@ export async function POST(request: Request) {
       return NextResponse.redirect(new URL('/dashboard?error=readonly', base));
     }
     const form = await request.formData();
-    const income = form.get('income');
-    const employment = form.get('employment');
+    const raw = Object.fromEntries(Array.from(form.entries()).map(([k, v]) => [k, typeof v === 'string' ? v : '']));
+    const parsed = formSchema.safeParse(raw);
+    if (!parsed.success) {
+      return NextResponse.redirect(new URL('/dashboard?error=invalid_form', request.url));
+    }
+    const { income, employment } = parsed.data;
     await prisma.application.create({
       data: {
         userId: session.user.id,
         type: 'credit_card',
         status: 'pending',
         amount: 5000,
-        metadata: { income: income?.toString(), employment: employment?.toString(), cardType: 'rewards' },
+        metadata: { income: income ?? undefined, employment: employment ?? undefined, cardType: 'rewards' },
       },
     });
     return NextResponse.redirect(new URL('/dashboard?app=credit_card_submitted', request.url));

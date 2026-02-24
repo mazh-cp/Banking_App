@@ -37,3 +37,4 @@ semgrep.sarif
 data/uploads/
 data/db/
 data/seed/*.zip
+data/security-events.jsonl

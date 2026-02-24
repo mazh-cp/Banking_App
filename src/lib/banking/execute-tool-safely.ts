@@ -17,6 +17,24 @@ const TOOL_ALLOWLIST: ToolName[] = [
   'banking.transferFunds',
 ];
 
+const ALLOWED_TOOL_KEYS: Record<ToolName, string[]> = {
+  'banking.getBalances': [],
+  'banking.getRecentTransactions': [],
+  'banking.getCreditProfile': [],
+  'banking.requestCreditIncrease': ['amount', 'reason'],
+  'banking.transferFunds': ['fromAccount', 'toAccount', 'amount'],
+};
+
+function validateAndSanitizeToolArgs(toolName: ToolName, args: Record<string, unknown>): { valid: boolean; sanitized: Record<string, unknown> } {
+  const allowed = new Set(ALLOWED_TOOL_KEYS[toolName]);
+  const sanitized: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (allowed.has(k)) sanitized[k] = v;
+    else return { valid: false, sanitized: {} };
+  }
+  return { valid: true, sanitized };
+}
+
 export type ExecuteToolSafelyParams = {
   toolName: ToolName;
   toolArgs: Record<string, unknown>;
@@ -39,6 +57,11 @@ export async function executeToolSafely(params: ExecuteToolSafelyParams): Promis
     return { tool: toolName, success: false, error: 'Tool not allowed' };
   }
 
+  const { valid, sanitized } = validateAndSanitizeToolArgs(toolName, toolArgs);
+  if (!valid) {
+    return { tool: toolName, success: false, error: 'Invalid tool arguments: unexpected or disallowed keys.' };
+  }
+
   const sensitiveTools: ToolName[] = ['banking.requestCreditIncrease', 'banking.transferFunds'];
   if (sensitiveTools.includes(toolName)) {
     const status = await getVerificationStatus(userId);
@@ -51,7 +74,7 @@ export async function executeToolSafely(params: ExecuteToolSafelyParams): Promis
     }
   }
 
-  const serializedArgs = JSON.stringify(toolArgs);
+  const serializedArgs = JSON.stringify(sanitized);
   const decision = await screenText({
     stage: 'TOOL_ARGS',
     text: serializedArgs,
@@ -90,12 +113,12 @@ export async function executeToolSafely(params: ExecuteToolSafelyParams): Promis
 
   let argsForTool: { amount?: number; reason?: string; fromAccount?: string; toAccount?: string } | undefined;
   if (toolName === 'banking.requestCreditIncrease') {
-    argsForTool = { amount: (toolArgs.amount as number) ?? 0, reason: (toolArgs.reason as string) ?? '' };
+    argsForTool = { amount: (sanitized.amount as number) ?? 0, reason: (sanitized.reason as string) ?? '' };
   } else if (toolName === 'banking.transferFunds') {
     argsForTool = {
-      fromAccount: (toolArgs.fromAccount as string) ?? 'checking',
-      toAccount: (toolArgs.toAccount as string) ?? 'savings',
-      amount: (toolArgs.amount as number) ?? 0,
+      fromAccount: (sanitized.fromAccount as string) ?? 'checking',
+      toAccount: (sanitized.toAccount as string) ?? 'savings',
+      amount: (sanitized.amount as number) ?? 0,
     };
   }
 

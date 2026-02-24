@@ -15,7 +15,7 @@ function SignupForm() {
   const router = useRouter();
 
   useEffect(() => {
-    fetch('/api/auth/csrf')
+    fetch('/api/auth/csrf', { credentials: 'include' })
       .then((res) => res.json())
       .then((data) => data.token && setCsrf(data.token));
   }, []);
@@ -28,6 +28,7 @@ function SignupForm() {
       const res = await fetch('/api/auth/signup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
           email,
           password,

@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, Suspense } from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
+import { useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 
 function LoginForm() {
@@ -10,12 +10,11 @@ function LoginForm() {
   const [csrf, setCsrf] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const router = useRouter();
   const searchParams = useSearchParams();
   const redirect = searchParams.get('redirect') || '/dashboard';
 
   useEffect(() => {
-    fetch('/api/auth/csrf')
+    fetch('/api/auth/csrf', { credentials: 'include' })
       .then((res) => res.json())
       .then((data) => data.token && setCsrf(data.token))
       .catch(() => setError('Could not load security token. Refresh the page.'));
@@ -29,17 +28,18 @@ function LoginForm() {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ email, password, csrfToken: csrf }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setError(data.error || 'Login failed');
+        setError(data.error || `Login failed (${res.status})`);
         return;
       }
-      router.push(redirect);
-      router.refresh();
-    } catch {
-      setError('Network error');
+      // Full page navigation so the new session cookie is sent on the next request
+      window.location.href = redirect;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Network error');
     } finally {
       setLoading(false);
     }

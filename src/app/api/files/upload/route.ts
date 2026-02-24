@@ -1,13 +1,13 @@
 import { NextResponse } from 'next/server';
 import { requireSession } from '@/lib/auth';
 import { prisma } from '@/lib/db';
-import { scanText } from '@/lib/security/lakera';
-import { getSecret } from '@/lib/admin/secrets-store';
+import { screenText, severityFromReasonCodes } from '@/lib/security/lakera-guard';
+import { getSecret, getConfig } from '@/lib/admin/secrets-store';
 import { mapScoreToLevel } from '@/lib/security/risk-scoring';
 import { extractText } from '@/lib/files/extract-text';
 import { getStoragePath, storeFile, sha256 } from '@/lib/files/storage';
 import { checkRateLimit } from '@/lib/rate-limit';
-import OpenAI from 'openai';
+import { getEmbeddingClient, getEmbeddingModel } from '@/lib/llm-embedding-client';
 import { v4 as uuidv4 } from 'uuid';
 
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_UPLOAD_BYTES) || 10 * 1024 * 1024; // 10MB
@@ -84,20 +84,31 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'No text could be extracted from the file' }, { status: 400 });
   }
 
-  const lakeraKey = await getSecret('LAKERA_API_KEY');
-  const scanResult = await scanText({
+  const [lakeraKey, projectId] = await Promise.all([getSecret('LAKERA_API_KEY'), getConfig('LAKERA_PROJECT_ID')]);
+  const fileDecision = await screenText({
+    stage: 'RAG_CONTEXT',
     text: text.slice(0, 50000),
-    context: undefined,
     userId: session.user.id,
-    mode: 'file',
+    correlationId: fileId,
     apiKey: lakeraKey,
+    projectId,
   });
 
-  const score = (scanResult.raw as { risk_score?: number })?.risk_score ?? (scanResult.flagged ? 0.7 : 0.1);
+  const fileFlagged = fileDecision.action === 'block' || fileDecision.action === 'mask';
+  const fileSeverity = severityFromReasonCodes(fileDecision.reasonCodes);
+  const severityToScore: Record<string, number> = { low: 0.1, medium: 0.35, high: 0.6, critical: 0.85 };
+  const score = severityToScore[fileSeverity] ?? (fileFlagged ? 0.7 : 0.1);
   const riskLevel = mapScoreToLevel(score);
   const quarantined = riskLevel === 'HIGH' || riskLevel === 'CRITICAL';
   const autoApprove = process.env.RAG_AUTO_APPROVE_LOW_MED === 'true';
   const approved = !quarantined && (autoApprove || false);
+
+  const scanResultRaw = {
+    request_uuid: (fileDecision.raw as { request_uuid?: string })?.request_uuid,
+    flagged: fileFlagged,
+    reasonCodes: fileDecision.reasonCodes,
+    severity: fileSeverity,
+  };
 
   const upload = await prisma.fileUpload.create({
     data: {
@@ -109,7 +120,7 @@ export async function POST(request: Request) {
       sizeBytes: file.size,
       sha256: sha256Hash,
       storagePath,
-      scanResult: scanResult.raw as object,
+      scanResult: scanResultRaw as object,
       approved,
       quarantined,
       chunkCount: 0,
@@ -120,9 +131,9 @@ export async function POST(request: Request) {
     data: {
       fileUploadId: upload.id,
       userId: session.user.id,
-      categories: scanResult.normalizedCategories as unknown as object,
-      severity: scanResult.severity,
-      flagged: scanResult.flagged,
+      categories: fileDecision.reasonCodes as unknown as object,
+      severity: fileSeverity,
+      flagged: fileFlagged,
       score,
       riskLevel,
       extractorWarnings: warnings as unknown as object,
@@ -152,13 +163,23 @@ export async function POST(request: Request) {
   }
 
   const chunks = chunkText(text);
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  const model = process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small';
+  const embeddingClient = getEmbeddingClient(process.env.OPENAI_API_KEY ?? process.env.LITELLM_API_KEY);
+  const model = getEmbeddingModel();
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i].slice(0, 8000);
-    const chunkScan = await scanText({ text: chunk, mode: 'file', apiKey: lakeraKey });
-    const chunkLevel = mapScoreToLevel((chunkScan.raw as { risk_score?: number })?.risk_score ?? 0);
+    const chunkDecision = await screenText({
+      stage: 'RAG_CONTEXT',
+      text: chunk,
+      userId: session.user.id,
+      correlationId: `${fileId}-chunk-${i}`,
+      apiKey: lakeraKey,
+      projectId,
+    });
+    const chunkFlagged = chunkDecision.action === 'block' || chunkDecision.action === 'mask';
+    const chunkSeverity = severityFromReasonCodes(chunkDecision.reasonCodes);
+    const chunkScore = severityToScore[chunkSeverity] ?? (chunkFlagged ? 0.7 : 0.1);
+    const chunkLevel = mapScoreToLevel(chunkScore);
     if (chunkLevel === 'HIGH' || chunkLevel === 'CRITICAL') {
       await prisma.fileUpload.update({
         where: { id: upload.id },
@@ -185,7 +206,7 @@ export async function POST(request: Request) {
         chunkCount: 0,
       });
     }
-    const embRes = await openai.embeddings.create({ model, input: chunk });
+    const embRes = await embeddingClient.embeddings.create({ model, input: chunk });
     const embedding = embRes.data[0]?.embedding;
     if (embedding) {
       await prisma.documentChunk.create({
